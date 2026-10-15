@@ -1314,8 +1314,6 @@ def _filter_log_events(data):
             if not pattern_fn(e.get("message", "")):
                 continue
             events.append({**e, "logStreamName": sn})
-            if len(events) >= limit:
-                break
 
     events.sort(key=lambda ev: ev["timestamp"])
     return json_response({"events": events[:limit], "searchedLogStreams": searched})
