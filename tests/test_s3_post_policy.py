@@ -11,8 +11,8 @@ import boto3
 import pytest
 import requests
 from botocore.config import Config
-
 from conftest import iam_user, routed_request
+
 from ministack.core.responses import AccountScopedDict, request_scope
 from ministack.services import iam, s3
 

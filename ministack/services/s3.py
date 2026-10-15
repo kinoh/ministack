@@ -70,6 +70,7 @@ from ministack.core.responses import (
     md5_hash,
     new_uuid,
     now_iso,
+    request_scope,
     set_request_account_id,
     set_request_region,
 )
@@ -3943,8 +3944,8 @@ def _enforce_post_policy_size(policy_b64: str, size: int):
     """Apply the `content-length-range` condition from a POST policy.
 
     Returns an error response when size is outside [min, max], else None.
-    Other policy conditions (key, starts-with, signature) are not enforced —
-    same lenient stance as ministack's presigned-URL handling.
+    Legacy forms use this size-only check; SigV4 forms validate all conditions
+    and credentials in _enforce_sigv4_post_policy.
     """
     if not policy_b64:
         return None
@@ -3979,6 +3980,137 @@ def _enforce_post_policy_size(policy_b64: str, size: int):
                 )
     return None
 
+def _enforce_sigv4_post_policy(fields: dict, bucket_name: str, region: str, size: int):
+    """Verify a SigV4 form and its expanded fields before any object mutation.
+
+    POST signs the Base64 policy itself, rather than a canonical HTTP request.
+    Anonymous and legacy SigV2 forms retain their existing handling.
+    """
+    def invalid():
+        logger.debug("S3 POST rejected: invalid policy document")
+        return _error("InvalidPolicyDocument", "The content of the form does not meet the conditions "
+                      "specified in the policy document.", 400)
+
+    def denied():
+        logger.debug("S3 POST rejected: policy condition not satisfied")
+        return _error("AccessDenied", "Access Denied", 403)
+
+    required = ("policy", "x-amz-algorithm", "x-amz-credential", "x-amz-date", "x-amz-signature")
+    if not all(fields.get(name) for name in required):
+        return _error("InvalidArgument", "Missing required form fields.", 400)
+    scope = fields["x-amz-credential"].split("/")
+    if (fields["x-amz-algorithm"] != "AWS4-HMAC-SHA256" or len(scope) != 5 or not all(scope)):
+        return _error("InvalidArgument", "Invalid signing fields.", 400)
+    access_key, date_stamp, signed_region, service, terminator = scope
+    try:
+        signed_at = _dt.datetime.strptime(fields["x-amz-date"], "%Y%m%dT%H%M%SZ")
+    except ValueError:
+        return _error("InvalidArgument", "Invalid signing date.", 400)
+    if (date_stamp != signed_at.strftime("%Y%m%d") or signed_region != region
+            or service != "s3" or terminator != "aws4_request"):
+        return _error("InvalidArgument", "Invalid credential scope.", 400)
+
+    encoded = fields["policy"]
+    try:
+        policy = json.loads(base64.b64decode(encoded, validate=True).decode("utf-8"))
+        if not isinstance(policy, dict):
+            return invalid()
+        expiration = policy.get("expiration")
+        conditions = policy.get("conditions")
+        if not isinstance(expiration, str) or not isinstance(conditions, list):
+            return invalid()
+        expires = _dt.datetime.fromisoformat(expiration.replace("Z", "+00:00"))
+        if expires.tzinfo is None:
+            return invalid()
+    except (ValueError, TypeError, RecursionError):
+        return invalid()
+
+    # Use the signer's tenant only for credential and IAM resolution. The
+    # bucket-owner scope chosen by _apply_bucket_scope must survive the upload.
+    try:
+        account = find_iam_access_key_account(access_key) or access_key
+    except AmbiguousAccessKeyError:
+        return _error("InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records.", 403)
+    with request_scope(get_account_id(), region):
+        set_request_account_id(account)
+        credential = resolve_credential(access_key, get_account_id(), fields.get("x-amz-security-token", ""))
+    if isinstance(credential, CredentialResolutionError):
+        if credential.code == "ExpiredTokenException":
+            return _error("ExpiredToken", "The provided token has expired.", 400)
+        if credential.code == "InvalidToken":
+            return _error("InvalidToken", credential.message, 400)
+        return _error("InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records.", 403)
+    computed = calculate_signature(credential.secret_access_key, date_stamp, signed_region, "s3", encoded)
+    if not signatures_match(computed, fields["x-amz-signature"]):
+        logger.debug("S3 POST rejected: signature mismatch")
+        return _error("SignatureDoesNotMatch", "The request signature we calculated does not match the signature "
+                      "you provided. Check your key and signing method.", 403)
+    if _dt.datetime.now(_dt.timezone.utc) >= expires:
+        return _error("AccessDenied", "Invalid according to Policy: Policy expired.", 403)
+
+    values = dict(fields, bucket=bucket_name)
+    if "bucket" in fields and fields["bucket"] != bucket_name:
+        return denied()
+    covered = set()
+    for condition in conditions:
+        if isinstance(condition, dict) and condition:
+            matches = [("eq", name, value) for name, value in condition.items()]
+        elif isinstance(condition, list) and len(condition) == 3:
+            operator, name, value = condition
+            if operator == "content-length-range":
+                if type(name) is not int or type(value) is not int or name < 0 or value < name:
+                    return invalid()
+                if size < name:
+                    return _error("EntityTooSmall", "Your proposed upload is smaller than the minimum allowed object size.", 400)
+                if size > value:
+                    return _error("EntityTooLarge", "Your proposed upload exceeds the maximum allowed size.", 400)
+                continue
+            if operator not in ("eq", "starts-with") or not isinstance(name, str) or not name.startswith("$"):
+                return invalid()
+            matches = [(operator, name[1:], value)]
+        else:
+            return invalid()
+        for operator, name, value in matches:
+            if not isinstance(name, str) or not name or not isinstance(value, str):
+                return invalid()
+            name = name.lower()
+            if name not in values:
+                return denied()
+            actual = values[name]
+            candidates = actual.split(",") if name == "content-type" and operator == "starts-with" else [actual]
+            if not all(candidate == value if operator == "eq" else candidate.startswith(value) for candidate in candidates):
+                return denied()
+            covered.add(name)
+    exempt = {"policy", "x-amz-signature", "file"}
+    if any(name not in covered and name not in exempt and not name.startswith("x-ignore-") for name in values):
+        return denied()
+
+    # Multipart credentials are absent from the router's Authorization header.
+    # Enforce the actual signer against the expanded object key under AUTH.
+    from ministack.app import AUTH
+    if AUTH:
+        from ministack.core.iam_evaluator import enforce
+
+        actions = {"s3:PutObject"}
+        if "acl" in fields or "x-amz-acl" in fields:
+            actions.add("s3:PutObjectAcl")
+        if "x-amz-tagging" in fields:
+            actions.add("s3:PutObjectTagging")
+        if "x-amz-object-lock-mode" in fields or "x-amz-object-lock-retain-until-date" in fields:
+            actions.add("s3:PutObjectRetention")
+        if "x-amz-object-lock-legal-hold" in fields:
+            actions.add("s3:PutObjectLegalHold")
+        context = {f"s3:{name}": value for name, value in fields.items() if name.startswith("x-amz-")}
+        if "acl" in fields:
+            context["s3:x-amz-acl"] = fields["acl"]
+        with request_scope(credential.account_id, signed_region):
+            for action in sorted(actions):
+                if enforce(access_key, action, "s3", signed_region,
+                           resource_arn=f"arn:aws:s3:::{bucket_name}/{fields['key']}", service_context=context) is not None:
+                    return denied()
+    return None
+
+
 def _post_form_access_key_id(parts) -> str:
     for name, _filename, _part_headers, value in parts:
         if name.lower() not in ("x-amz-credential", "awsaccesskeyid"):
@@ -3993,18 +4125,14 @@ def _post_form_access_key_id(parts) -> str:
 def _post_object(bucket_name: str, body: bytes, headers: dict):
     """Browser-based form upload (RFC 1867 / S3 PostObject).
 
-    Per https://docs.aws.amazon.com/AmazonS3/latest/API/RTPM-mpuoverview.html,
+    Per https://docs.aws.amazon.com/AmazonS3/latest/developerguide/RESTObjectPOST.html,
     callers POST a multipart/form-data body to the bucket root. We honour
     `key` (with `${filename}` substitution), `Content-Type`, `x-amz-meta-*`,
     `x-amz-storage-class`, `x-amz-tagging`, `success_action_status`, and
-    `success_action_redirect`. Policy and signature fields are accepted and
-    ignored — same lenient stance as ministack's presigned-URL handling.
+    `success_action_redirect`. SigV4 forms verify policy and signature before
+    writing the object, independently of AUTH.
     """
     parts = _parse_multipart_form(headers.get("content-type", ""), body)
-
-    access_key_id = _post_form_access_key_id(parts)
-    if access_key_id:
-        set_request_account_id(access_key_id)
 
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
@@ -4037,14 +4165,20 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
     if file_value is None:
         return _error("InvalidArgument", "POST requires a file field.", 400)
 
-    err = _enforce_post_policy_size(fields.get("policy", ""), len(file_value))
-    if err:
-        return err
-
+    sigv4 = any(name in fields for name in ("x-amz-algorithm", "x-amz-credential", "x-amz-date", "x-amz-signature"))
+    if sigv4:
+        fields = {name: value.replace("${filename}", file_filename or "")
+                  if name not in {"policy", "x-amz-signature"} else value for name, value in fields.items()}
     key_template = fields.get("key", "")
     if not key_template:
         return _error("InvalidArgument", "Bucket POST must contain a field named 'key'.", 400)
     key = key_template.replace("${filename}", file_filename or "")
+    if sigv4:
+        err = _enforce_sigv4_post_policy(fields, bucket_name, bucket["region"], len(file_value))
+    else:
+        err = _enforce_post_policy_size(fields.get("policy", ""), len(file_value))
+    if err:
+        return err
 
     # Build a synthetic header dict so _build_object_record reuses the PUT path.
     synth = {}
