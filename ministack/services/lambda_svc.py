@@ -2755,8 +2755,9 @@ _revision_locks_guard = threading.Lock()
 def _serialized_revision_update(*, alias=False):
     def decorate(operation):
         @wraps(operation)
-        def guarded(name, *args, **kwargs):
-            alias_name = args[0] if alias else None
+        def guarded(*args, **kwargs):
+            name = args[0] if args else kwargs["func_name" if alias else "name"]
+            alias_name = (args[1] if len(args) > 1 else kwargs["alias_name"]) if alias else None
             key = (get_account_id(), get_region(), name, alias_name)
             with _revision_locks_guard:
                 lock = _revision_locks.get(key)
@@ -2767,7 +2768,7 @@ def _serialized_revision_update(*, alias=False):
             # a waiter must never acquire a replacement lock for the same key.
             # Reentrant acquisition cannot deadlock a same-thread nested call.
             with lock:
-                return operation(name, *args, **kwargs)
+                return operation(*args, **kwargs)
         return guarded
     return decorate
 
