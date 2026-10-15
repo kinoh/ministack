@@ -4041,7 +4041,8 @@ def _enforce_sigv4_post_policy(fields: dict, bucket_name: str, region: str, size
             return _error("InvalidToken", credential.message, 400)
         return _error("InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records.", 403)
     computed = calculate_signature(credential.secret_access_key, date_stamp, signed_region, "s3", encoded)
-    if not signatures_match(computed, fields["x-amz-signature"]):
+    signature = fields["x-amz-signature"]
+    if not re.fullmatch(r"[0-9a-f]{64}", signature) or not signatures_match(computed, signature):
         logger.debug("S3 POST rejected: signature mismatch")
         return _error("SignatureDoesNotMatch", "The request signature we calculated does not match the signature "
                       "you provided. Check your key and signing method.", 403)
