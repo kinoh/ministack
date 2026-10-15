@@ -45,7 +45,7 @@ def _update(operation, revision="function-before", value="changed", name="revisi
 def test_stale_revision_rejects_before_mutation_or_side_effects(functions, monkeypatch, operation):
     fetch = Mock(side_effect=AssertionError("stale request fetched code"))
     monkeypatch.setattr(svc, "_fetch_code_from_s3", fetch)
-    before = copy.deepcopy(functions)
+    before = copy.deepcopy(functions._data)
     if operation == "code":
         result = svc._update_code("revision-test", {
             "RevisionId": "stale", "S3Bucket": "unused", "S3Key": "unused",
@@ -65,7 +65,7 @@ def test_stale_revision_rejects_before_mutation_or_side_effects(functions, monke
     status, _, body = result
     assert status == 412
     assert json.loads(body)["__type"] == "PreconditionFailedException"
-    assert functions == before
+    assert functions._data == before
     fetch.assert_not_called()
     for helper in (svc.invalidate_worker, svc._pool_kill_function, svc._sweep_extract_cache,
                    svc._schedule_state_transition, svc._snapstart_provision_version_async):
@@ -139,6 +139,7 @@ def test_competing_updates_with_same_revision_have_one_winner(functions, monkeyp
 
 def test_slow_code_update_does_not_block_independent_resources(functions, monkeypatch):
     entered, release = threading.Event(), threading.Event()
+    prototype = copy.deepcopy(functions["revision-test"])
 
     def fetch(*args, **kwargs):
         entered.set()
@@ -156,9 +157,7 @@ def test_slow_code_update_does_not_block_independent_resources(functions, monkey
             for account, region in (("222222222222", "us-east-1"), ("000000000000", "eu-west-1")):
                 def other_tenant():
                     with request_scope(account, region):
-                        functions["revision-test"] = copy.deepcopy(functions["unrelated"] if "unrelated" in functions
-                                                                   else {"config": {"RevisionId": "function-before"}})
-                        functions["revision-test"]["config"]["RevisionId"] = "function-before"
+                        functions["revision-test"] = copy.deepcopy(prototype)
                         return _update("config")
                 assert pool.submit(other_tenant).result(timeout=2)[0] == 200
         finally:
