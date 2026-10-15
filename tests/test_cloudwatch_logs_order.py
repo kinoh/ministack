@@ -55,3 +55,173 @@ def test_filter_does_not_stop_later_stream_after_partial_global_limit(log_group)
     assert [e["message"] for e in json.loads(response[2])["events"]] == [
         "match first", "match second",
     ]
+
+
+def filter_events(group, **parameters):
+    response = logs._filter_log_events({"logGroupName": group, **parameters})
+    assert response[0] == 200
+    return json.loads(response[2])["events"]
+
+
+def count_filter_calls(monkeypatch):
+    compile_pattern = logs._compile_filter_pattern
+    checked = []
+
+    def compile_counted(pattern):
+        matcher = compile_pattern(pattern)
+
+        def matches(message):
+            checked.append(message)
+            return matcher(message)
+
+        return matches
+
+    monkeypatch.setattr(logs, "_compile_filter_pattern", compile_counted)
+    return checked
+
+
+def test_limit_stops_filtering_after_oldest_matches(log_group, monkeypatch):
+    now = int(time.time() * 1000)
+    put_messages(log_group, "a", [(now + i, f"match {i}") for i in range(2, 202, 2)])
+    put_messages(log_group, "b", [(now + i, f"match {i}") for i in range(1, 202, 2)])
+    # A later request can carry events older than those already stored.
+    assert logs._put_log_events({
+        "logGroupName": log_group, "logStreamName": "a",
+        "logEvents": [{"timestamp": now, "message": "skip"}],
+    })[0] == 200
+    checked = count_filter_calls(monkeypatch)
+    events = filter_events(log_group, filterPattern="match", limit=2)
+    assert [event["message"] for event in events] == ["match 1", "match 2"]
+    assert checked == ["skip", "match 1", "match 2"]
+
+
+def test_time_window_seeks_without_scanning_history(log_group):
+    now = int(time.time() * 1000)
+    put_messages(log_group, "history", [(now + i, f"event {i}") for i in range(8192)])
+    timestamp_reads = []
+
+    class CountedEvent(dict):
+        def __getitem__(self, key):
+            if key == "timestamp":
+                timestamp_reads.append(None)
+            return super().__getitem__(key)
+
+    stream = logs._log_groups[log_group]["streams"]["history"]
+    stream["events"] = [CountedEvent(event) for event in stream["events"]]
+    events = filter_events(log_group, startTime=now + 8000, endTime=now + 8001, limit=10)
+    assert [event["message"] for event in events] == ["event 8000", "event 8001"]
+    # Allow headroom for binary searches and merge setup, but no linear scan.
+    assert len(timestamp_reads) < 100
+
+
+def test_late_batch_keeps_reads_ordered_and_live_delivery_exact(log_group, monkeypatch):
+    now = int(time.time() * 1000)
+    put_messages(log_group, "s", [(now + 30, "newer")])
+    deliveries = []
+    monkeypatch.setattr(logs, "_fanout_to_live_tail_sessions",
+                        lambda group, stream, events: deliveries.extend(events))
+    assert logs._put_log_events({
+        "logGroupName": log_group, "logStreamName": "s",
+        "logEvents": [
+            {"timestamp": now + 10, "message": "older"},
+            {"timestamp": now + 20, "message": "middle"},
+        ],
+    })[0] == 200
+    response = logs._get_log_events({
+        "logGroupName": log_group, "logStreamName": "s", "startFromHead": True,
+    })
+    assert response[0] == 200
+    assert [event["message"] for event in json.loads(response[2])["events"]] == [
+        "older", "middle", "newer",
+    ]
+    assert [event["message"] for event in deliveries] == ["older", "middle"]
+    stored = filter_events(log_group)
+    assert [event["eventId"] for event in stored[:2]] == [event["eventId"] for event in deliveries]
+
+
+@pytest.mark.parametrize("stream_order", [["a", "b"], ["b", "a"]])
+def test_equal_timestamps_keep_selected_stream_and_arrival_order(log_group, stream_order):
+    now = int(time.time() * 1000)
+    for stream in ("a", "b"):
+        put_messages(log_group, stream, [(now, f"{stream} first")])
+        assert logs._put_log_events({
+            "logGroupName": log_group, "logStreamName": stream,
+            "logEvents": [{"timestamp": now, "message": f"{stream} second"}],
+        })[0] == 200
+    events = filter_events(log_group, logStreamNames=stream_order, limit=3)
+    first, second = stream_order
+    assert [event["message"] for event in events] == [
+        f"{first} first", f"{first} second", f"{second} first",
+    ]
+
+
+def test_legacy_persistence_restores_order_before_limited_reads(log_group, monkeypatch, tmp_path):
+    from ministack.core import persistence
+
+    now = int(time.time() * 1000)
+    put_messages(log_group, "s", [(now + i, f"event {i}") for i in range(20)])
+    state = logs.get_state()
+    state["log_groups"][log_group]["streams"]["s"]["events"].reverse()
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+    persistence.save_state("cloudwatch_logs", state)
+    assert logs._delete_log_group({"logGroupName": log_group})[0] == 200
+    logs.load_persisted_state(persistence.load_state("cloudwatch_logs"))
+    checked = count_filter_calls(monkeypatch)
+    events = filter_events(log_group, limit=1)
+    assert [event["message"] for event in events] == ["event 0"]
+    assert checked == ["event 0"]
+
+
+@pytest.mark.parametrize("producer", ["codebuild", "dynamodb"])
+def test_native_writers_keep_order_after_future_dated_api_event(log_group, monkeypatch, producer):
+    now = int(time.time() * 1000)
+    if producer == "codebuild":
+        from ministack.services import codebuild
+
+        stream_name = "native"
+        emit = codebuild._log_sink({"logs": {"groupName": log_group, "streamName": stream_name}})
+        monkeypatch.setattr(codebuild.time, "time", lambda: now / 1000)
+    else:
+        from ministack.services import dynamodb
+
+        monkeypatch.setattr(dynamodb, "_IMPORT_LOG_GROUP", log_group)
+        monkeypatch.setattr(dynamodb.time, "time", lambda: now / 1000)
+        import_id = uuid.uuid4().hex
+        stream_name = f"{import_id}/error"
+
+        def emit(message):
+            dynamodb._log_import_error(f"arn:aws:dynamodb:us-east-1:000000000000:table/t/import/{import_id}",
+                                      "bucket", "key", 0, message)
+
+    emit("initial")
+    assert logs._put_log_events({
+        "logGroupName": log_group, "logStreamName": stream_name,
+        "logEvents": [{"timestamp": now + 3000, "message": "future API event"}],
+    })[0] == 200
+    emit("later native event")
+    events = filter_events(log_group, limit=2)
+    assert len(events) == 2
+    assert [event["timestamp"] for event in events] == [now, now]
+    assert "initial" in events[0]["message"]
+    assert "later native event" in events[1]["message"]
+
+
+def test_reader_remains_consistent_during_late_arrival(log_group, monkeypatch):
+    now = int(time.time() * 1000)
+    put_messages(log_group, "s", [(now + 10, "ten"), (now + 20, "twenty")])
+    inserted = False
+
+    def matcher(message):
+        nonlocal inserted
+        if not inserted:
+            inserted = True
+            assert logs._put_log_events({
+                "logGroupName": log_group, "logStreamName": "s",
+                "logEvents": [{"timestamp": now, "message": "zero"}],
+            })[0] == 200
+        return True
+
+    monkeypatch.setattr(logs, "_compile_filter_pattern", lambda pattern: matcher)
+    assert [event["message"] for event in filter_events(log_group, limit=2)] == ["ten", "twenty"]
+    assert [event["message"] for event in filter_events(log_group, limit=2)] == ["zero", "ten"]
