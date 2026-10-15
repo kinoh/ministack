@@ -4,6 +4,7 @@ Expected conditions come from the S3 POST policy documentation, not a live AWS r
 """
 import asyncio
 import json
+import time
 import uuid
 from xml.etree import ElementTree
 
@@ -14,7 +15,7 @@ from botocore.config import Config
 from conftest import iam_user, routed_request
 
 from ministack.core.responses import AccountScopedDict, request_scope
-from ministack.services import iam, s3
+from ministack.services import iam, s3, sts
 
 
 @pytest.fixture
@@ -31,10 +32,10 @@ def post_form(monkeypatch):
 
         class Form:
             def generate(self, *, fields=None, conditions=None, key_name="uploads/data.txt", expires=300,
-                         secret=None, token=None):
+                         secret=None, token=None, access_key=None):
                 client = boto3.client(
                     "s3", endpoint_url="http://localhost", region_name="us-east-1",
-                    aws_access_key_id=key[0], aws_secret_access_key=secret or key[1],
+                    aws_access_key_id=access_key or key[0], aws_secret_access_key=secret or key[1],
                     aws_session_token=token, config=Config(signature_version="s3v4"),
                 )
                 return client.generate_presigned_post(
@@ -203,3 +204,81 @@ def test_post_registered_key_resolves_nondefault_account(post_form):
         finally:
             iam._access_keys.pop(key[0], None)
             iam._users.pop(arn.rsplit("/", 1)[-1], None)
+
+
+@pytest.mark.parametrize("signature", ["", "not-hex", "é" * 64])
+def test_post_malformed_signature_is_a_client_error(post_form, signature):
+    form = post_form.generate()
+    form["x-amz-signature"] = signature
+    post_form.assert_rejected(form, "InvalidArgument" if not signature else "SignatureDoesNotMatch")
+
+
+@pytest.mark.parametrize("token_state", ["valid", "missing", "incorrect", "expired"])
+def test_post_uses_sts_issued_credentials(post_form, token_state):
+    response = routed_request(post_form.key, "sts", "POST", "/",
+        body=b"Action=GetSessionToken&DurationSeconds=900",
+        headers={"content-type": "application/x-www-form-urlencoded"})
+    assert response[0] == 200
+    root = ElementTree.fromstring(response[2])
+    credentials = {name: root.findtext(".//{*}" + name) for name in ("AccessKeyId", "SecretAccessKey", "SessionToken")}
+    access_key = credentials["AccessKeyId"]
+    try:
+        token = credentials["SessionToken"]
+        if token_state == "missing":
+            token = None
+        elif token_state == "incorrect":
+            token = uuid.uuid4().hex
+        elif token_state == "expired":
+            sts._sessions[access_key]["Expiration"] = time.time() - 60
+        form = post_form.generate(access_key=access_key, secret=credentials["SecretAccessKey"], token=token)
+        if token_state == "valid":
+            assert post_form.submit(form)[0] == 204
+        else:
+            post_form.assert_rejected(form, "ExpiredToken" if token_state == "expired" else "InvalidToken")
+    finally:
+        sts._sessions.pop(access_key, None)
+
+
+def test_post_configured_root_credentials(post_form, monkeypatch):
+    key, secret = "local-root-" + uuid.uuid4().hex, uuid.uuid4().hex
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", key)
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", secret)
+    assert post_form.submit(post_form.generate(access_key=key, secret=secret))[0] == 204
+
+
+@pytest.mark.parametrize("name,value,action", [
+    ("acl", "private", "s3:PutObjectAcl"),
+    ("x-amz-tagging", "purpose=test", "s3:PutObjectTagging"),
+    ("x-amz-object-lock-legal-hold", "ON", "s3:PutObjectLegalHold"),
+    ("x-amz-object-lock-mode", "GOVERNANCE", "s3:PutObjectRetention"),
+])
+def test_post_additional_write_permissions(post_form, auth, name, value, action):
+    user = iam._access_keys[post_form.key[0]]["UserName"]
+    statement = {"Effect": "Allow", "Action": ["s3:PutObject"],
+                 "Resource": f"arn:aws:s3:::{post_form.bucket}/uploads/*"}
+    iam._user_inline_policies[user] = {"upload": json.dumps({"Version": "2012-10-17", "Statement": [statement]})}
+    form = post_form.generate(fields={name: value}, conditions=[{name: value}])
+    post_form.assert_rejected(form, "AccessDenied", routed=True)
+    statement["Action"].append(action)
+    iam._user_inline_policies[user] = {"upload": json.dumps({"Version": "2012-10-17", "Statement": [statement]})}
+    assert post_form.submit(form, routed=True)[0] == 204
+
+
+def test_rejected_post_preserves_existing_object_and_disk(post_form, monkeypatch, tmp_path):
+    monkeypatch.setattr(s3, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(s3, "S3_PERSIST", True)
+    events = []
+    monkeypatch.setattr(s3, "_fire_s3_event_async", lambda *a, **kw: events.append(kw))
+    assert post_form.submit(post_form.generate(), data=b"original")[0] == 204
+    files = {str(path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    assert files
+    invalid = post_form.generate(secret=uuid.uuid4().hex)
+    assert post_form.submit(invalid, data=b"replacement")[0] == 403
+    assert {str(path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == files
+    assert len(events) == 1
+    obj = s3._buckets[post_form.bucket]["objects"]["uploads/data.txt"]
+    assert s3._read_body(post_form.bucket, "uploads/data.txt", obj) == b"original"
+    s3._buckets.clear()
+    s3._load_persisted_data()
+    obj = s3._buckets[post_form.bucket]["objects"]["uploads/data.txt"]
+    assert s3._read_body(post_form.bucket, "uploads/data.txt", obj) == b"original"
