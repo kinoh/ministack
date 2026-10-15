@@ -84,12 +84,19 @@ def test_matching_and_omitted_revisions_allow_updates(functions, operation):
     assert _update(operation, None)[0] == 200
 
 
-def test_revision_updates_preserve_keyword_call_support(functions):
+@pytest.mark.parametrize("style", ["keyword", "mixed", "data-keyword"])
+def test_revision_updates_preserve_keyword_call_support(functions, style):
     assert svc._update_code(name="revision-test", data={"RevisionId": "function-before"})[0] == 200
     revision = functions["revision-test"]["config"]["RevisionId"]
     assert svc._update_config(name="revision-test", data={"RevisionId": revision})[0] == 200
-    assert svc._update_alias(func_name="revision-test", alias_name="live",
-                             data={"RevisionId": "alias-before"})[0] == 200
+    data = {"RevisionId": "alias-before"}
+    if style == "keyword":
+        result = svc._update_alias(func_name="revision-test", alias_name="live", data=data)
+    elif style == "mixed":
+        result = svc._update_alias("revision-test", alias_name="live", data=data)
+    else:
+        result = svc._update_alias("revision-test", "live", data=data)
+    assert result[0] == 200
 
 
 @pytest.mark.parametrize("first,second", [("code", "code"), ("code", "config"),
