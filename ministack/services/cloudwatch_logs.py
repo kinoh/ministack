@@ -26,12 +26,15 @@ import base64
 import contextlib
 import copy
 import fnmatch
+import heapq
 import json
 import logging
 import os
 import re
+import threading
 import time
 import zlib
+from bisect import bisect_left, bisect_right
 from datetime import datetime, timezone
 
 from ministack.core.arn import ArnParseError, parse_arn
@@ -52,6 +55,8 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 
 _log_groups = AccountRegionScopedDict()
+# Protect appends and cursor bounds; never hold this during delivery or filtering.
+_log_events_lock = threading.Lock()
 # group_name -> {
 #   arn, creationTime, retentionInDays (int|None), tags: {str: str},
 #   subscriptionFilters: {filterName: {filterName, logGroupName, filterPattern,
@@ -206,7 +211,12 @@ def load_persisted_state(data):
 
 def _restore_state(data):
     if data:
-        _log_groups.update(data.get("log_groups", {}))
+        with _log_events_lock:
+            _log_groups.update(data.get("log_groups", {}))
+            # Older snapshots stored arrival order, including late events.
+            for _, group in _log_groups.all_items():
+                for stream in group.get("streams", {}).values():
+                    stream["events"] = sorted(stream["events"], key=_event_timestamp)
         _destinations.update(data.get("destinations", {}))
         _resource_policies.update(data.get("resource_policies", {}))
         _log_group_policies.update(data.get("log_group_policies", {}))
@@ -571,6 +581,36 @@ def _describe_log_streams(data):
 # Log events
 # ---------------------------------------------------------------------------
 
+def _event_timestamp(event):
+    return event["timestamp"]
+
+
+def _append_log_events(stream, events):
+    """Keep chronological history and stable ties for every log producer.
+
+    Chronological batches extend the existing array without copying history.
+    A late batch replaces it with a stable merge, leaving captured readers'
+    arrays intact. Readers capture their array and end bound under the lock.
+    """
+    if not events:
+        return
+    ordered = sorted(events, key=_event_timestamp)
+    first, last = ordered[0]["timestamp"], ordered[-1]["timestamp"]
+    with _log_events_lock:
+        history = stream["events"]
+        late = bool(history and history[-1]["timestamp"] > first)
+        if late:
+            stream["events"] = list(heapq.merge(history, ordered, key=_event_timestamp))
+        else:
+            history.extend(ordered)
+        if stream["firstEventTimestamp"] is None or first < stream["firstEventTimestamp"]:
+            stream["firstEventTimestamp"] = first
+        if stream["lastEventTimestamp"] is None or last > stream["lastEventTimestamp"]:
+            stream["lastEventTimestamp"] = last
+        stream["lastIngestionTime"] = events[-1]["ingestionTime"]
+    logger.debug("Stored log events count=%d late_batch=%s", len(events), late)
+
+
 def _put_log_events(data):
     group = data.get("logGroupName")
     stream = data.get("logStreamName")
@@ -589,12 +629,13 @@ def _put_log_events(data):
 
     s = _log_groups[group]["streams"][stream]
     now_ms = int(time.time() * 1000)
+    stored = []
 
     for e in events:
         ts = e.get("timestamp", now_ms)
         msg = e.get("message", "")
         ptr = new_uuid()
-        s["events"].append({
+        stored.append({
             "timestamp": ts,
             "message": msg,
             "ingestionTime": now_ms,
@@ -608,18 +649,13 @@ def _put_log_events(data):
             log_stream=stream,
         )
 
-        if s["firstEventTimestamp"] is None or ts < s["firstEventTimestamp"]:
-            s["firstEventTimestamp"] = ts
-        if s["lastEventTimestamp"] is None or ts > s["lastEventTimestamp"]:
-            s["lastEventTimestamp"] = ts
-        s["lastIngestionTime"] = now_ms
+    _append_log_events(s, stored)
 
     token = str(int(s["uploadSequenceToken"]) + 1)
     s["uploadSequenceToken"] = token
 
     _fanout_to_subscription_filters(group, stream, events)
     # Fan out the stored shape (ingestionTime filled) to any Live Tail sessions.
-    stored = s["events"][-len(events) :] if events else []
     _fanout_to_live_tail_sessions(group, stream, stored)
     return json_response({"nextSequenceToken": token})
 
@@ -1281,6 +1317,11 @@ def _compile_filter_pattern(raw: str):
     return _matches
 
 
+def _stream_event_range(events, stream_name, start, end):
+    for index in range(start, end):
+        yield events[index], stream_name
+
+
 def _filter_log_events(data):
     group = _resolve_log_group_name(data)
     raw_pattern = data.get("filterPattern", "")
@@ -1298,25 +1339,34 @@ def _filter_log_events(data):
 
     events = []
     searched = []
+    ranges = []
     streams = _log_groups[group]["streams"]
     target_streams = stream_names if stream_names else list(streams.keys())
 
-    for sn in target_streams:
-        if sn not in streams:
-            continue
-        searched.append({"logStreamName": sn, "searchedCompletely": True})
-        for e in streams[sn]["events"]:
-            ts = e["timestamp"]
-            if start_time is not None and ts < start_time:
+    with _log_events_lock:
+        for sn in target_streams:
+            stream = streams.get(sn)
+            if stream is None:
                 continue
-            if end_time is not None and ts > end_time:
-                continue
-            if not pattern_fn(e.get("message", "")):
-                continue
-            events.append({**e, "logStreamName": sn})
+            searched.append({"logStreamName": sn, "searchedCompletely": True})
+            history = stream["events"]
+            start = bisect_left(history, start_time, key=_event_timestamp) if start_time is not None else 0
+            end = bisect_right(history, end_time, key=_event_timestamp) if end_time is not None else len(history)
+            ranges.append(_stream_event_range(history, sn, start, end))
 
-    events.sort(key=lambda ev: ev["timestamp"])
-    return json_response({"events": events[:limit], "searchedLogStreams": searched})
+    # merge is stable across input streams and only pulls the next candidate.
+    scanned = 0
+    for event, sn in heapq.merge(*ranges, key=lambda entry: entry[0]["timestamp"]):
+        if len(events) >= limit:
+            break
+        scanned += 1
+        if pattern_fn(event.get("message", "")):
+            events.append({**event, "logStreamName": sn})
+            if len(events) >= limit:
+                break
+    logger.debug("FilterLogEvents streams=%d scanned=%d returned=%d limit=%s",
+                 len(ranges), scanned, len(events), limit)
+    return json_response({"events": events, "searchedLogStreams": searched})
 
 
 # ---------------------------------------------------------------------------

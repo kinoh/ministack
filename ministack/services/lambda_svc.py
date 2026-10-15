@@ -4955,12 +4955,10 @@ def _emit_lambda_logs(func: dict, request_id: str, log_text: str,
                 lines.append(_report())
         else:
             lines = [start, *(log_text.splitlines() if log_text else []), end, _report()]
-        for line in lines:
-            stream["events"].append({"timestamp": now_ms, "message": line, "ingestionTime": now_ms})
-        if stream["firstEventTimestamp"] is None:
-            stream["firstEventTimestamp"] = now_ms
-        stream["lastEventTimestamp"] = now_ms
-        stream["lastIngestionTime"] = now_ms
+        _cwl._append_log_events(stream, [
+            {"timestamp": now_ms, "message": line, "ingestionTime": now_ms}
+            for line in lines
+        ])
         # Forward to any subscription filters on this group (e.g. Lambda log
         # processor pattern), matching AWS (#896).
         _cwl._fanout_to_subscription_filters(
