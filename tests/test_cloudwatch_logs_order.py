@@ -225,3 +225,68 @@ def test_reader_remains_consistent_during_late_arrival(log_group, monkeypatch):
     monkeypatch.setattr(logs, "_compile_filter_pattern", lambda pattern: matcher)
     assert [event["message"] for event in filter_events(log_group, limit=2)] == ["ten", "twenty"]
     assert [event["message"] for event in filter_events(log_group, limit=2)] == ["zero", "ten"]
+
+
+def test_mixed_batches_and_ranges_match_stable_reference(log_group):
+    import random
+
+    randomizer = random.Random(731)
+    now = int(time.time() * 1000)
+    arrivals = {name: [] for name in ("a", "b", "c")}
+    for name in arrivals:
+        assert logs._create_log_stream({"logGroupName": log_group, "logStreamName": name})[0] == 200
+    for batch in range(30):
+        name = randomizer.choice(list(arrivals))
+        records = [{"timestamp": now + randomizer.randrange(12),
+                    "message": f"{'keep' if index % 2 else 'drop'} {batch}-{index}"}
+                   for index in range(4)]
+        arrivals[name].extend(records)
+        assert logs._put_log_events({
+            "logGroupName": log_group, "logStreamName": name, "logEvents": records,
+        })[0] == 200
+    for selection in (["a", "b", "c"], ["c", "a"], ["missing", "b"]):
+        reference = sorted((dict(event, logStreamName=name)
+                            for name in selection for event in arrivals.get(name, [])),
+                           key=lambda event: event["timestamp"])
+        for lower, upper in ((0, 11), (3, 7), (5, 5), (9, 2)):
+            expected = [event for event in reference if now + lower <= event["timestamp"] <= now + upper
+                        and "keep" in event["message"]]
+            for limit in (1, 7, 10000):
+                actual = filter_events(log_group, logStreamNames=selection, filterPattern="keep",
+                                       startTime=now + lower, endTime=now + upper, limit=limit)
+                assert [(event["timestamp"], event["message"], event["logStreamName"]) for event in actual] == [
+                    (event["timestamp"], event["message"], event["logStreamName"])
+                    for event in expected[:limit]
+                ]
+
+
+def test_concurrent_late_batches_preserve_every_event(log_group):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from ministack.core.responses import get_account_id, get_region, request_scope
+
+    now = int(time.time() * 1000)
+    put_messages(log_group, "shared", [])
+    account, region = get_account_id(), get_region()
+    barrier = Barrier(4)
+
+    def write(worker):
+        with request_scope(account, region):
+            barrier.wait(timeout=5)
+            for batch in reversed(range(8)):
+                timestamp = now + batch * 4 + worker
+                assert logs._put_log_events({
+                    "logGroupName": log_group, "logStreamName": "shared",
+                    "logEvents": [{"timestamp": timestamp, "message": f"event {timestamp}"}],
+                })[0] == 200
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(write, worker) for worker in range(4)]
+        for future in futures:
+            future.result(timeout=10)
+    events = filter_events(log_group, limit=100)
+    assert [event["timestamp"] for event in events] == list(range(now, now + 32))
+    stream = logs._log_groups[log_group]["streams"]["shared"]
+    assert stream["firstEventTimestamp"] == now
+    assert stream["lastEventTimestamp"] == now + 31
