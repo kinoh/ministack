@@ -3991,24 +3991,28 @@ def _enforce_sigv4_post_policy(fields: dict, bucket_name: str, region: str, size
         return _error("InvalidPolicyDocument", "The content of the form does not meet the conditions "
                       "specified in the policy document.", 400)
 
-    def denied():
-        logger.debug("S3 POST rejected: policy condition not satisfied")
+    def denied(reason="policy condition not satisfied"):
+        logger.debug("S3 POST rejected: %s", reason)
         return _error("AccessDenied", "Access Denied", 403)
+
+    def invalid_argument(reason):
+        logger.debug("S3 POST rejected: %s", reason)
+        return _error("InvalidArgument", "Invalid Argument", 400)
 
     required = ("policy", "x-amz-algorithm", "x-amz-credential", "x-amz-date", "x-amz-signature")
     if not all(fields.get(name) for name in required):
-        return _error("InvalidArgument", "Missing required form fields.", 400)
+        return invalid_argument("missing required signing field")
     scope = fields["x-amz-credential"].split("/")
     if (fields["x-amz-algorithm"] != "AWS4-HMAC-SHA256" or len(scope) != 5 or not all(scope)):
-        return _error("InvalidArgument", "Invalid signing fields.", 400)
+        return invalid_argument("invalid signing fields")
     access_key, date_stamp, signed_region, service, terminator = scope
     try:
         signed_at = _dt.datetime.strptime(fields["x-amz-date"], "%Y%m%dT%H%M%SZ")
     except ValueError:
-        return _error("InvalidArgument", "Invalid signing date.", 400)
+        return invalid_argument("invalid signing date")
     if (date_stamp != signed_at.strftime("%Y%m%d") or signed_region != region
             or service != "s3" or terminator != "aws4_request"):
-        return _error("InvalidArgument", "Invalid credential scope.", 400)
+        return invalid_argument("invalid credential scope")
 
     encoded = fields["policy"]
     try:
@@ -4047,7 +4051,7 @@ def _enforce_sigv4_post_policy(fields: dict, bucket_name: str, region: str, size
         return _error("SignatureDoesNotMatch", "The request signature we calculated does not match the signature "
                       "you provided. Check your key and signing method.", 403)
     if _dt.datetime.now(_dt.timezone.utc) >= expires:
-        return _error("AccessDenied", "Invalid according to Policy: Policy expired.", 403)
+        return denied("policy expired")
 
     values = dict(fields, bucket=bucket_name)
     if "bucket" in fields and fields["bucket"] != bucket_name:
@@ -4108,7 +4112,7 @@ def _enforce_sigv4_post_policy(fields: dict, bucket_name: str, region: str, size
             for action in sorted(actions):
                 if enforce(access_key, action, "s3", signed_region,
                            resource_arn=f"arn:aws:s3:::{bucket_name}/{fields['key']}", service_context=context) is not None:
-                    return denied()
+                    return denied("signer lacks object write permission")
     return None
 
 
