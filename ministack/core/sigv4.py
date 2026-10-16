@@ -198,6 +198,28 @@ def parse_header_signature(headers: Mapping[str, Any]) -> HeaderSignature | tupl
     return HeaderSignature(*scope[:4], fields["SignedHeaders"], fields["Signature"], amz_date)
 
 
+def _query_value(query_params: Mapping[str, Any], name: str) -> str:
+    value = query_params.get(name, query_params.get(name.lower(), ""))
+    return (value[0] if value else "") if isinstance(value, list) else value
+
+
+def parse_query_signature(query_params: Mapping[str, Any]) -> HeaderSignature | tuple[str, str]:
+    """Split a query-string (presigned) signature into its parts, or name the part that is missing."""
+    credential = _query_value(query_params, "X-Amz-Credential")
+    for name in ("X-Amz-Signature", "X-Amz-SignedHeaders", "X-Amz-Date"):
+        if not _query_value(query_params, name):
+            return "IncompleteSignature", (
+                f"AWS query-string parameters must include '{name}'. Re-examine the query-string parameters.")
+    scope = credential.split("/")
+    if len(scope) != 5:
+        return "IncompleteSignature", (
+            "Credential must have exactly 5 slash-delimited elements, e.g. keyid/date/region/service/term, "
+            f"got '{credential}'"
+        )
+    return HeaderSignature(*scope[:4], _query_value(query_params, "X-Amz-SignedHeaders"),
+                           _query_value(query_params, "X-Amz-Signature"), _query_value(query_params, "X-Amz-Date"))
+
+
 # Services that accept a request signed up to 15 minutes from their clock; the others allow 5.
 _FIFTEEN_MINUTE_SERVICES = frozenset({"dynamodb", "ecr", "elasticache", "iam", "rds", "s3", "sns", "sqs", "sts"})
 
@@ -261,15 +283,19 @@ def header_signature_failure(
     query_params: Mapping[str, Any],
     headers: Mapping[str, Any],
     body: bytes,
+    *,
+    presigned: bool = False,
 ) -> tuple[str, str] | None:
-    """Recompute a header signature; S3 signs its path as sent, other services the normalized path encoded again."""
+    """Recompute a header (or, ``presigned``, query-string) signature; S3 signs its path as sent, other services
+    the normalized path encoded again."""
     if signature.date_stamp != signature.amz_date[:8]:
         return "CredentialDateMismatch", (
             "Date in Credential scope does not match YYYYMMDD from ISO-8601 version of date from HTTP. ")
     path = raw_path if signature.service == "s3" else uri_encode(_remove_dot_segments(raw_path), encode_slash=False)
     payload_hash = headers.get("x-amz-content-sha256") or hashlib.sha256(body).hexdigest()
+    excluded = ("x-amz-signature",) if presigned else ()
     canonical_request = "\n".join([
-        method, path, build_canonical_query_string(query_params, exclude=()),
+        method, path, build_canonical_query_string(query_params, exclude=excluded),
         build_canonical_headers(headers, signature.signed_headers), signature.signed_headers, payload_hash,
     ])
     string_to_sign = build_string_to_sign(
