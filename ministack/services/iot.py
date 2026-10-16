@@ -24,9 +24,9 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
     ``CreateProvisioningClaim``, and fleet provisioning over MQTT
     (``$aws/certificates/create/json`` and
     ``$aws/provisioning-templates/{name}/provision/json``, after the
-    template's pre-provisioning hook allows it);
-    ``provisioningRoleArn`` is presence-checked but not resolved
-    (MiniStack does not validate IAM role ARNs elsewhere either)
+    template's pre-provisioning hook allows it); with ``AUTH=true``
+    RegisterThing needs a ``provisioningRoleArn`` that IoT may assume and
+    that allows its writes
   - Policies: ``CreatePolicy``, ``CreatePolicyVersion``, ``AttachPolicy``,
     ``DetachPolicy``, etc., plus the deprecated principal-policy family
     (``AttachPrincipalPolicy`` / ``DetachPrincipalPolicy`` /
@@ -218,7 +218,7 @@ _retained: dict[str, "_RetainedMessage"] = {}
 
 
 class _RetainedMessage:
-    __slots__ = ("payload", "properties", "qos", "topic", "ts")
+    __slots__ = ("expires_at", "payload", "properties", "qos", "topic", "ts")
 
     def __init__(self, topic: str, payload: bytes, qos: int, properties: bytes = b"",
                  ts: float | None = None):
@@ -229,6 +229,11 @@ class _RetainedMessage:
         # a message published by a 3.1.1 client.
         self.properties = properties
         self.ts = time.time() if ts is None else ts
+        self.expires_at = _message_expires_at(properties, self.ts)
+
+    def expired(self, now: float) -> bool:
+        """Whether the message's MQTT 5 expiry interval has run out."""
+        return self.expires_at is not None and now >= self.expires_at
 
 
 def _broker_get_state() -> dict:
@@ -326,6 +331,12 @@ def _restore_state(data: dict | None) -> None:
     _ca_certificates.update(data.get("ca_certificates", {}))
     _registration_codes.update(data.get("registration_codes", {}))
     _provisioning_templates.update(data.get("provisioning_templates", {}))
+    # Older state kept a template's body on the record, as its only version.
+    for record in _provisioning_templates.all_values():
+        if "versions" not in record:
+            body = record.pop("templateBody")
+            record["versions"] = {"1": _provisioning_template_version(1, body, record["creationDate"])}
+            record["lastVersionId"] = 1
     _provisioning_claims.update(data.get("provisioning_claims", {}))
     _ownership_tokens.update(data.get("ownership_tokens", {}))
     _jobs.update(data.get("jobs", {}))
@@ -340,6 +351,9 @@ def _restore_state(data: dict | None) -> None:
             if legacy and not _tags.contains_scoped(account, region, record[arn_key]):
                 _tags.set_scoped(account, region, record[arn_key],
                                  {t["Key"]: t.get("Value", "") for t in legacy})
+    for (account_id, region, _), job in _jobs.all_items():
+        if job.get("rolloutQueue"):
+            _jobs_rollout_start(account_id, region, job)
     ca_data = data.get("ca")
     if ca_data:
         cert = ca_data.get("ca_cert_pem")
@@ -386,6 +400,8 @@ def reset() -> None:
     _job_executions.clear()
     _job_templates.clear()
     _tags.clear()
+    # Retained messages are part of the state get_state() saves.
+    _retained.clear()
     with _CA_LOCK:
         _ca_cert_pem = None
         _ca_key_pem = None
@@ -494,10 +510,41 @@ def _parse_body(body: bytes) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _error_not_found(resource: str, name: str) -> tuple:
-    return error_response_json(
-        "ResourceNotFoundException", f"{resource} {name!r} not found", 404
-    )
+# AWS's ResourceNotFoundException wording per resource, or per operation where it differs.
+_NOT_FOUND_MESSAGES = {
+    "Thing": "Thing {name} not found.",
+    "DescribeThing": "Thing {account}:{name} not found.",
+    "ListThingGroupsForThing": "thing does not exist",
+    "ListThingPrincipals": "Failed to list principals for thing{name} because the thing does not exist in your account",
+    "AttachThingPrincipal": "Failed to attach the principal {principal} to thing {name} because the thing does not "
+    "exist in your account",
+    "DetachThingPrincipal": "Failed to detach the principal {principal} from thing {name} because the thing does not "
+    "exist in your account",
+    "AttachThingPrincipal:principal": "Can't attach the principal {principal} to thing {name} because the principal "
+    "does not exist in your account",
+    "DetachThingPrincipal:principal": "Can't detach the principal {principal} from thing {name} because the principal "
+    "does not exist in your account",
+    "ListPrincipalThings": "Can't list things for the principal {name} because the principal does not exist in your "
+    "account",
+    "ThingType": "Thing Type {account}:{name} not found.",
+    "ThingGroup": "ThingGroup {account}:{name} not found.",
+    "UpdateThingGroup": "Group {name} does not exist",
+    "ThingGroupMember": "Cannot find requested thing group for accountId: {account} and thing group name: {name}",
+    "Certificate": "CertificateId {name} does not exist",
+    "CACertificate": "Requested CA Certificate does not exist.",
+    "Policy": "Policy not found",
+    "GetPolicy": "Policy default version not found",
+    "PolicyVersion": "Policy version does not exist (name={policy}, versionId={name})",
+    "Job": "Job {name} cannot be found.",
+    "JobExecution": "Job execution for thing {thing} cannot be found within job {name}.",
+    "JobExecution:job": "Job execution cannot be found as the Job {name} does not exist.",
+}
+
+
+def _error_not_found(resource: str, name: str, **fields) -> tuple:
+    template = _NOT_FOUND_MESSAGES.get(resource, "{resource} {name!r} not found")
+    message = template.format(resource=resource, name=name, account=get_account_id(), **fields)
+    return error_response_json("ResourceNotFoundException", message, 404)
 
 
 def _qp_bool(qp: dict, name: str, default: bool = False) -> bool:
@@ -603,7 +650,7 @@ async def _route_request(
     if path == "/provisioning-templates" and method == "GET":
         return _list_provisioning_templates(qp)
     if path.startswith("/provisioning-templates/"):
-        return _handle_provisioning_template(method, path, body)
+        return _handle_provisioning_template(method, path, body, qp)
 
     # Certificates
     if path == "/keys-and-certificate" and method == "POST":
@@ -1297,7 +1344,7 @@ def _handle_thing(method: str, path: str, body: bytes, qp: dict) -> tuple:
     if method == "PATCH":
         return _update_thing(name, _parse_body(body))
     if method == "DELETE":
-        return _delete_thing(name)
+        return _delete_thing(name, qp.get("expectedVersion"))
     return error_response_json(
         "InvalidRequestException", f"Unsupported method: {method}", 400
     )
@@ -1353,7 +1400,7 @@ def _create_thing(name: str, payload: dict) -> tuple:
 def _describe_thing(name: str) -> tuple:
     thing = _things.get(name)
     if thing is None:
-        return _error_not_found("Thing", name)
+        return _error_not_found("DescribeThing", name)
     body = {
         "thingName": thing["thingName"],
         "thingId": thing["thingId"],
@@ -1423,10 +1470,17 @@ def _update_thing(name: str, payload: dict) -> tuple:
     return json_response({})
 
 
-def _delete_thing(name: str) -> tuple:
+def _delete_thing(name: str, expected_version=None) -> tuple:
+    """DeleteThing; an unknown name answers 200 like a completed delete."""
     thing = _things.get(name)
     if thing is None:
-        return _error_not_found("Thing", name)
+        return json_response({})
+    if expected_version not in (None, "") and str(expected_version) != str(thing.get("version", 1)):
+        return error_response_json(
+            "VersionConflictException",
+            f"The version for thing {name} does not match the expected version.",
+            409,
+        )
     if any(p.rsplit("/", 1)[-1] in _certificates for p in thing.get("principals", [])):
         return error_response_json(
             "InvalidRequestException",
@@ -1586,7 +1640,7 @@ def _deprecate_thing_type(name: str, payload: dict) -> tuple:
 def _delete_thing_type(name: str) -> tuple:
     t = _thing_types.get(name)
     if t is None:
-        return _error_not_found("ThingType", name)
+        return json_response({})
     if not t["thingTypeMetadata"].get("deprecated"):
         return error_response_json(
             "InvalidRequestException",
@@ -1689,7 +1743,9 @@ def _create_thing_group(name: str, payload: dict) -> tuple:
     attr_payload = props.get("attributePayload") or {}
     parent = payload.get("parentGroupName")
     if parent and parent not in _thing_groups:
-        return _error_not_found("ThingGroup", parent)
+        return error_response_json(
+            "InvalidRequestException", f"Cannot create group using non-existing group as parent : {parent}", 400
+        )
     record = {
         "thingGroupName": name,
         "thingGroupId": new_uuid(),
@@ -1742,7 +1798,7 @@ def _list_things_in_thing_group(path: str) -> tuple:
     middle = path[len("/thing-groups/"):-len("/things")]
     g = _thing_groups.get(middle)
     if g is None:
-        return _error_not_found("ThingGroup", middle)
+        return _error_not_found("ThingGroupMember", middle)
     return json_response({"things": list(g.get("things", []))})
 
 
@@ -1764,7 +1820,7 @@ def _list_thing_groups_for_thing(path: str) -> tuple:
         )
     thing = _things.get(middle)
     if thing is None:
-        return _error_not_found("Thing", middle)
+        return _error_not_found("ListThingGroupsForThing", middle)
     return json_response({
         "thingGroups": [
             {"groupName": g, "groupArn": _thing_group_arn(g)}
@@ -1779,7 +1835,7 @@ def _list_thing_groups_for_thing(path: str) -> tuple:
 def _update_thing_group(name: str, payload: dict) -> tuple:
     g = _thing_groups.get(name)
     if g is None:
-        return _error_not_found("ThingGroup", name)
+        return _error_not_found("UpdateThingGroup", name)
     props = payload.get("thingGroupProperties") or {}
     if props:
         g["thingGroupProperties"].update({
@@ -1799,7 +1855,7 @@ def _update_thing_group(name: str, payload: dict) -> tuple:
 def _delete_thing_group(name: str) -> tuple:
     g = _thing_groups.get(name)
     if g is None:
-        return _error_not_found("ThingGroup", name)
+        return json_response({})
     if any((c.get("thingGroupMetadata") or {}).get("parentGroupName") == name for c in _thing_groups.values()):
         return error_response_json(
             "InvalidRequestException",
@@ -1832,7 +1888,7 @@ async def _add_thing_to_group(payload: dict) -> tuple:
         )
     group = _thing_groups.get(gname)
     if group is None:
-        return _error_not_found("ThingGroup", gname)
+        return _error_not_found("ThingGroupMember", gname)
     thing = _things.get(tname)
     if thing is None:
         return _error_not_found("Thing", tname)
@@ -1857,10 +1913,11 @@ async def _remove_thing_from_group(payload: dict) -> tuple:
     tname = payload.get("thingName")
     group = _thing_groups.get(gname) if gname else None
     thing = _things.get(tname) if tname else None
-    if group is None:
-        return _error_not_found("ThingGroup", gname or "")
     if thing is None:
         return _error_not_found("Thing", tname or "")
+    if group is None:
+        # Only a named group that does not exist answers 200; a group ARN is not resolved.
+        return json_response({}) if gname else _error_not_found("ThingGroup", "")
     prev_next = jobs_first_pending_job_id(tname)
     left = tname in group.get("things", [])
     if left:
@@ -1880,9 +1937,9 @@ async def _remove_thing_from_group(payload: dict) -> tuple:
 #
 # CRUD, CreateProvisioningClaim and the fleet provisioning MQTT API (JSON
 # topics) that applies a template to a certificate created over MQTT, once the
-# template's pre-provisioning hook allows it. provisioningRoleArn is
-# presence-checked but never resolved — MiniStack does
-# not validate IAM role ARNs elsewhere either. Template versions are not
+# template's pre-provisioning hook allows it; with AUTH=true RegisterThing
+# answers AccessDenied unless provisioningRoleArn names a role IoT may assume
+# that allows every write it makes. Template versions are not
 # modeled: a template always carries defaultVersionId 1. Wire shapes and
 # error messages mirror a live probe of the real service (2026-08-26).
 # ---------------------------------------------------------------------------
@@ -1902,9 +1959,25 @@ def _validate_provisioning_template_name(name: str | None) -> tuple | None:
     return None
 
 
+def _provisioning_template_resource_error(resource, certificates: int) -> str | None:
+    """Why the service refuses one resource of a template body, or None."""
+    props = resource.get("Properties")
+    if props is None:
+        return "Properties of a resource cannot be null."
+    if resource.get("Type") != "AWS::IoT::Certificate":
+        return None
+    if certificates:
+        return "Only one certificate resource can be defined"
+    if not isinstance(props, dict) or props.get("CertificateId") != {"Ref": "AWS::IoT::Certificate::Id"}:
+        return "CertificateId must contain a reference to AWS::IoT::Certificate::Id"
+    status = props.get("Status")
+    if not isinstance(status, str) or status.lower() not in ("active", "inactive"):
+        return 'A certificate resource must specify a Status of either "Active" or "Inactive"'
+    return None
+
+
 def _validate_provisioning_template_body(body) -> tuple | None:
-    """The live service refuses a body without an AWS::IoT::Certificate
-    resource; its message is quoted verbatim below."""
+    """Refuse a body the live service refuses, with its messages verbatim."""
     doc = body
     if not isinstance(doc, dict):
         try:
@@ -1914,15 +1987,22 @@ def _validate_provisioning_template_body(body) -> tuple | None:
     if not isinstance(doc, dict):
         return error_response_json(
             "InvalidRequestException",
-            "The template body is invalid: Template body is not valid JSON.",
+            "The template body is invalid",
             400,
         )
     resources = doc.get("Resources")
     values = resources.values() if isinstance(resources, dict) else ()
-    if not any(
-        isinstance(r, dict) and r.get("Type") == "AWS::IoT::Certificate"
-        for r in values
-    ):
+    certificates = 0
+    for resource in values:
+        if not isinstance(resource, dict):
+            continue
+        reason = _provisioning_template_resource_error(resource, certificates)
+        if reason:
+            return error_response_json(
+                "InvalidRequestException", f"The template body is invalid: {reason}", 400
+            )
+        certificates += resource.get("Type") == "AWS::IoT::Certificate"
+    if not certificates:
         return error_response_json(
             "InvalidRequestException",
             "The template body is invalid: Template must have certificate resource.",
@@ -2007,18 +2087,30 @@ def _provisioning_template_not_found(name: str) -> tuple:
     )
 
 
-def _handle_provisioning_template(method: str, path: str, body: bytes) -> tuple:
+def _handle_provisioning_template(method: str, path: str, body: bytes, qp: dict) -> tuple:
     suffix = path[len("/provisioning-templates/"):]
     name, _, sub = suffix.partition("/")
-    if sub and (method, sub) != ("POST", "provisioning-claim"):
+    version = sub[len("versions/"):] if sub.startswith("versions/") else None
+    routes = {("POST", "provisioning-claim"), ("POST", "versions"), ("GET", "versions")}
+    if sub and (method, sub) not in routes and not (
+        version and "/" not in version and method in ("GET", "DELETE")
+    ):
         return error_response_json(
             "InvalidRequestException", f"Unsupported IoT path: {method} {path}", 400
         )
     err = _validate_provisioning_template_name(name)
     if err:
         return err
-    if sub:
+    if sub == "provisioning-claim":
         return _create_provisioning_claim(name)
+    if sub == "versions" and method == "POST":
+        return _create_provisioning_template_version(name, _parse_body(body), qp)
+    if sub == "versions":
+        return _list_provisioning_template_versions(name)
+    if version is not None and method == "GET":
+        return _describe_provisioning_template_version(name, version)
+    if version is not None:
+        return _delete_provisioning_template_version(name, version)
     if method == "GET":
         return _describe_provisioning_template(name)
     if method == "PATCH":
@@ -2061,13 +2153,14 @@ def _create_provisioning_template(payload: dict) -> tuple:
     record = {
         "templateName": name,
         "templateArn": _provisioning_template_arn(name),
-        "templateBody": payload["templateBody"],
         "enabled": bool(payload.get("enabled", False)),
         "provisioningRoleArn": payload["provisioningRoleArn"],
         "type": payload.get("type", "FLEET_PROVISIONING"),
         "defaultVersionId": 1,
         "creationDate": now,
         "lastModifiedDate": now,
+        "versions": {"1": _provisioning_template_version(1, payload["templateBody"], now)},
+        "lastVersionId": 1,
     }
     # The live service omits description from Describe when it was never set —
     # absent, not empty — so an unset one is not stored at all.
@@ -2085,11 +2178,21 @@ def _create_provisioning_template(payload: dict) -> tuple:
     })
 
 
+def _provisioning_template_version(version_id: int, body, created: float) -> dict:
+    return {"versionId": version_id, "creationDate": created, "templateBody": body}
+
+
+def _provisioning_template_body(t: dict):
+    """The body of the template's default version."""
+    return t["versions"][str(t["defaultVersionId"])]["templateBody"]
+
+
 def _describe_provisioning_template(name: str) -> tuple:
     t = _provisioning_templates.get(name)
     if t is None:
         return _provisioning_template_not_found(name)
-    return json_response(t)
+    out = {k: v for k, v in t.items() if k not in ("versions", "lastVersionId")}
+    return json_response({**out, "templateBody": _provisioning_template_body(t)})
 
 
 def _list_provisioning_templates(qp: dict) -> tuple:
@@ -2115,10 +2218,10 @@ def _update_provisioning_template(name: str, payload: dict) -> tuple:
     if t is None:
         return _provisioning_template_not_found(name)
     version = payload.get("defaultVersionId")
-    if version is not None and version != t["defaultVersionId"]:
+    if version is not None and str(version) not in t["versions"]:
         return error_response_json(
             "InvalidRequestException",
-            f"ProvisioningTemplate {name!r} has no version {version}",
+            f"Unable to set version {version} as the default, version does not exist",
             400,
         )
     hook = None if payload.get("removePreProvisioningHook") else payload.get("preProvisioningHook")
@@ -2139,18 +2242,108 @@ def _update_provisioning_template(name: str, payload: dict) -> tuple:
         t.pop("preProvisioningHook", None)
     elif hook:
         t["preProvisioningHook"] = _provisioning_hook(hook)
+    if version is not None:
+        t["defaultVersionId"] = int(version)
     t["lastModifiedDate"] = _now_epoch()
     _provisioning_templates[name] = t
     # The live service answers 200 with an empty body — not an empty JSON
-    # object — and does not bump defaultVersionId.
+    # object.
     return 200, {"Content-Type": "application/x-amz-json-1.0"}, b""
 
 
 def _delete_provisioning_template(name: str) -> tuple:
     if _provisioning_templates.get(name) is None:
-        return _provisioning_template_not_found(name)
+        return error_response_json("ResourceNotFoundException", "Unable to delete template, template not found", 404)
     _tags.pop(_provisioning_templates.pop(name)["templateArn"], None)
     logger.info("IoT provisioning template deleted: %s", name)
+    return json_response({})
+
+
+_PROVISIONING_TEMPLATE_VERSIONS_MAX = 5
+
+
+def _create_provisioning_template_version(name: str, payload: dict, qp: dict) -> tuple:
+    """``CreateProvisioningTemplateVersion``: version ids count up and are never reused."""
+    t = _provisioning_templates.get(name)
+    if t is None:
+        return _provisioning_template_not_found(name)
+    body = payload.get("templateBody")
+    if not body:
+        return error_response_json("InvalidRequestException", "templateBody is required", 400)
+    err = _validate_provisioning_template_body(body)
+    if err:
+        return err
+    if len(t["versions"]) >= _PROVISIONING_TEMPLATE_VERSIONS_MAX:
+        return error_response_json(
+            "VersionsLimitExceededException",
+            f"Can't create a template version for the template {name}, "
+            "the maximum number of template versions has been reached",
+            409,
+        )
+    version_id = t["lastVersionId"] + 1
+    now = _now_epoch()
+    t["versions"][str(version_id)] = _provisioning_template_version(version_id, body, now)
+    t["lastVersionId"] = version_id
+    is_default = str(qp.get("setAsDefault", "")).lower() == "true"
+    if is_default:
+        t["defaultVersionId"] = version_id
+    t["lastModifiedDate"] = now
+    _provisioning_templates[name] = t
+    return json_response({
+        "templateArn": t["templateArn"],
+        "templateName": name,
+        "versionId": version_id,
+        "isDefaultVersion": is_default,
+    })
+
+
+def _list_provisioning_template_versions(name: str) -> tuple:
+    """``ListProvisioningTemplateVersions``: all versions in one page, whatever maxResults asks for."""
+    t = _provisioning_templates.get(name)
+    if t is None:
+        return error_response_json("ResourceNotFoundException", f"Template named {name} not found", 404)
+    return json_response({"versions": [
+        {
+            "versionId": v["versionId"],
+            "creationDate": v["creationDate"],
+            "isDefaultVersion": v["versionId"] == t["defaultVersionId"],
+        }
+        for v in t["versions"].values()
+    ]})
+
+
+def _describe_provisioning_template_version(name: str, version_id: str) -> tuple:
+    t = _provisioning_templates.get(name)
+    if t is None:
+        return error_response_json("ResourceNotFoundException", f"Unable to find a template named {name}", 404)
+    v = t["versions"].get(version_id)
+    if v is None:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Unable to find a template version with ID {version_id} for template {name}",
+            404,
+        )
+    return json_response({**v, "isDefaultVersion": v["versionId"] == t["defaultVersionId"]})
+
+
+def _delete_provisioning_template_version(name: str, version_id: str) -> tuple:
+    t = _provisioning_templates.get(name)
+    if t is None:
+        return _provisioning_template_not_found(name)
+    v = t["versions"].get(version_id)
+    if v is None:
+        return error_response_json(
+            "ResourceNotFoundException", f"Unable to find template version {version_id}", 404
+        )
+    if v["versionId"] == t["defaultVersionId"]:
+        return error_response_json(
+            "InvalidRequestException",
+            f"Unable to delete template version {version_id}, it is the default version",
+            400,
+        )
+    del t["versions"][version_id]
+    t["lastModifiedDate"] = _now_epoch()
+    _provisioning_templates[name] = t
     return json_response({})
 
 
@@ -2304,6 +2497,10 @@ async def _fleet_register_thing(
         if not template.get("enabled"):
             return _fleet_rejected("InvalidTemplate", f"Template {template_name} is not enabled.")
         token = request.get("certificateOwnershipToken")
+        if token is None or token == "":
+            return _fleet_rejected(
+                "InvalidCertificateOwnershipToken", "Certificate ownership token cannot be empty."
+            )
         record = _ownership_tokens.get(token) if isinstance(token, str) else None
         cert = (
             _certificates.get(record["certificateId"])
@@ -2330,7 +2527,7 @@ async def _fleet_register_thing(
                     "InvalidCertificateOwnershipToken", "Certificate ownership token is invalid."
                 )
         plan = _provisioning_plan(template, parameters, cert["certificateId"])
-        thing_name = await _apply_provisioning_plan(plan, cert)
+        thing_name = await _apply_provisioning_plan(plan, cert, template.get("provisioningRoleArn") or "")
     reply = {"deviceConfiguration": plan["deviceConfiguration"]}
     if thing_name is not None:
         reply["thingName"] = thing_name
@@ -2402,8 +2599,8 @@ def _provisioning_hook_overrides(result: dict) -> dict:
 
 
 def _provisioning_plan(template: dict, parameters: dict, cert_id: str) -> dict:
-    """The template's resources with ``Ref`` and ``Fn::Join`` resolved against the parameters."""
-    body = template["templateBody"]
+    """The template's resources with ``Ref`` and the intrinsic functions resolved against the parameters."""
+    body = _provisioning_template_body(template)
     body = json.loads(body) if isinstance(body, str) else body
     declared = body.get("Parameters")
     values = {
@@ -2413,6 +2610,26 @@ def _provisioning_plan(template: dict, parameters: dict, cert_id: str) -> dict:
     }
     values.update(parameters)
     values[_CERTIFICATE_ID_PARAMETER] = cert_id
+    mappings = body.get("Mappings") if isinstance(body.get("Mappings"), dict) else {}
+
+    def invalid(function):
+        return _ProvisioningRejected(
+            "InvalidTemplate", f"Template {template['templateName']} has an invalid {function}."
+        )
+
+    def reference(name):
+        if values.get(name) is None:
+            raise _ProvisioningRejected("InvalidParameters", f"Cannot resolve reference value: {name}")
+        return values[name]
+
+    def substitute(text, variables):
+        def one(match):
+            name = match.group(1)
+            if name.startswith("!"):
+                return "${" + name[1:] + "}"
+            return str(variables[name]) if name in variables else str(reference(name))
+
+        return re.sub(r"\$\{([^}]*)\}", one, text)
 
     def resolve(value):
         if isinstance(value, list):
@@ -2422,24 +2639,46 @@ def _provisioning_plan(template: dict, parameters: dict, cert_id: str) -> dict:
         if len(value) == 1:
             function, argument = next(iter(value.items()))
             if function == "Ref":
-                if values.get(argument) is None:
-                    raise _ProvisioningRejected(
-                        "InvalidParameters", f"Cannot resolve reference value: {argument}"
-                    )
-                return values[argument]
-            if (
-                function == "Fn::Join"
-                and isinstance(argument, list)
-                and len(argument) == 2
-                and isinstance(argument[1], list)
-            ):
-                return str(argument[0]).join(str(resolve(v)) for v in argument[1])
-            if function.startswith("Fn::"):
-                raise _ProvisioningRejected(
-                    "InvalidTemplate",
-                    f"Template {template['templateName']} uses {function}, "
-                    "which MiniStack does not resolve.",
-                )
+                return reference(argument)
+            if not function.startswith("Fn::"):
+                return {function: resolve(argument)}
+            argument = resolve(argument)
+            if function == "Fn::Join":
+                if not (isinstance(argument, list) and len(argument) == 2 and isinstance(argument[1], list)):
+                    raise invalid(function)
+                return str(argument[0]).join(str(v) for v in argument[1])
+            if function == "Fn::Select":
+                if not (isinstance(argument, list) and len(argument) == 2 and isinstance(argument[1], list)):
+                    raise invalid(function)
+                try:
+                    index = int(argument[0])
+                except (TypeError, ValueError):
+                    raise invalid(function) from None
+                if not 0 <= index < len(argument[1]) or argument[1][index] is None:
+                    raise invalid(function)
+                return argument[1][index]
+            if function == "Fn::Split":
+                if not (isinstance(argument, list) and len(argument) == 2
+                        and isinstance(argument[0], str) and isinstance(argument[1], str) and argument[0]):
+                    raise invalid(function)
+                return argument[1].split(argument[0])
+            if function == "Fn::FindInMap":
+                if not (isinstance(argument, list) and len(argument) == 3):
+                    raise invalid(function)
+                found = mappings.get(argument[0])
+                found = found.get(argument[1]) if isinstance(found, dict) else None
+                found = found.get(argument[2]) if isinstance(found, dict) else None
+                if found is None:
+                    raise invalid(function)
+                return found
+            if function == "Fn::Sub":
+                if isinstance(argument, str):
+                    return substitute(argument, {})
+                if (isinstance(argument, list) and len(argument) == 2
+                        and isinstance(argument[0], str) and isinstance(argument[1], dict)):
+                    return substitute(argument[0], argument[1])
+                raise invalid(function)
+            raise invalid(function)
         return {k: resolve(v) for k, v in value.items()}
 
     plan = {"thing": None, "status": "ACTIVE", "policies": []}
@@ -2454,13 +2693,19 @@ def _provisioning_plan(template: dict, parameters: dict, cert_id: str) -> dict:
         elif kind == "AWS::IoT::Certificate":
             plan["status"] = str(properties.get("Status") or "ACTIVE").upper()
         elif kind == "AWS::IoT::Policy":
-            if "PolicyDocument" in properties:
-                raise _ProvisioningRejected(
-                    "InvalidTemplate",
-                    f"Template {template['templateName']} creates a policy from a "
-                    "PolicyDocument, which MiniStack does not support.",
-                )
-            plan["policies"].append(properties.get("PolicyName"))
+            document = properties.get("PolicyDocument")
+            if document is None:
+                plan["policies"].append((properties.get("PolicyName"), None))
+                continue
+            if "PolicyName" in properties:
+                raise invalid("AWS::IoT::Policy")
+            document = document if isinstance(document, str) else json.dumps(document)
+            try:
+                json.loads(document)
+            except ValueError:
+                raise invalid("AWS::IoT::Policy") from None
+            # The developer guide: PolicyName "Defaults to a hash of the policy document".
+            plan["policies"].append((hashlib.sha256(document.encode("utf-8")).hexdigest(), document))
     plan["deviceConfiguration"] = resolve(body.get("DeviceConfiguration") or {})
     return plan
 
@@ -2469,17 +2714,23 @@ def _java_map(attributes: dict) -> str:
     return "{" + ", ".join(f"{k}={v}" for k, v in sorted(attributes.items())) + "}"
 
 
-async def _apply_provisioning_plan(plan: dict, cert: dict) -> str | None:
+async def _apply_provisioning_plan(plan: dict, cert: dict, role_arn: str) -> str | None:
     """Create or update the thing, then activate and attach the certificate; a rejection changes nothing."""
     account = get_account_id()
-    for policy in plan["policies"]:
-        if _policies.get(policy) is None:
+    for policy, document in plan["policies"]:
+        if document is None and _policies.get(policy) is None:
             raise _provisioning_failed(
                 "Register thing workflow execution terminates due to: Policy default version not found"
             )
-    if plan["thing"] is None:
-        name = None
-    else:
+    cert_arn = cert["certificateArn"]
+    requests = [("iot:UpdateCertificate", cert_arn)]
+    for policy, document in plan["policies"]:
+        if document is not None and _policies.get(policy) is None:
+            requests.append(("iot:CreatePolicy", _policy_arn(policy)))
+        requests.append(("iot:AttachPolicy", cert_arn))
+    name = update = None
+    join = leave = []
+    if plan["thing"] is not None:
         properties, overrides = plan["thing"]
         name = properties.get("ThingName")
         if not isinstance(name, str) or not _NAME_RE.match(name):
@@ -2500,32 +2751,79 @@ async def _apply_provisioning_plan(plan: dict, cert: dict) -> str | None:
                 )
         thing = _things.get(name)
         if thing is None:
-            _create_thing(name, {
-                "attributePayload": {"attributes": attributes or {}},
-                "thingTypeName": type_name or None,
-            })
-            join, leave = list(groups or ()), []
+            join = list(groups or ())
+            requests.append(("iot:CreateThing", _thing_arn(name)))
         else:
             update, join, leave = _provisioning_thing_changes(
                 thing, attributes, type_name, groups, overrides
             )
             if update:
-                _update_thing(name, update)
+                requests.append(("iot:UpdateThing", _thing_arn(name)))
+        requests += [("iot:AddThingToThingGroup", _thing_group_arn(g)) for g in join]
+        requests += [("iot:RemoveThingFromThingGroup", _thing_group_arn(g)) for g in leave]
+        requests.append(("iot:AttachThingPrincipal", _thing_arn(name)))
+    if not _provisioning_role_allows(role_arn, requests):
+        raise _ProvisioningRejected("AccessDenied", "Access Denied", 403)
+    if name is not None:
+        if _things.get(name) is None:
+            _create_thing(name, {
+                "attributePayload": {"attributes": attributes or {}},
+                "thingTypeName": type_name or None,
+            })
+        elif update:
+            _update_thing(name, update)
         for group in join:
             await _add_thing_to_group({"thingGroupName": group, "thingName": name})
         for group in leave:
             await _remove_thing_from_group({"thingGroupName": group, "thingName": name})
         thing = _things[name]
-        if cert["certificateArn"] not in thing.setdefault("principals", []):
-            thing["principals"].append(cert["certificateArn"])
+        if cert_arn not in thing.setdefault("principals", []):
+            thing["principals"].append(cert_arn)
             _things[name] = thing
         if thing["thingArn"] not in cert.setdefault("attachedThings", []):
             cert["attachedThings"].append(thing["thingArn"])
     cert["status"] = plan["status"]
     _certificates[cert["certificateId"]] = cert
-    for policy in plan["policies"]:
-        _change_policy_target(policy, cert["certificateArn"], attach=True)
+    for policy, document in plan["policies"]:
+        if document is not None and _policies.get(policy) is None:
+            _create_policy(policy, {"policyDocument": document})
+        _change_policy_target(policy, cert_arn, attach=True)
     return name
+
+
+def _provisioning_role_allows(role_arn: str, requests: list[tuple[str, str]]) -> bool:
+    """Under AUTH=true, whether the template's provisioning role is one IoT may assume and allows every write."""
+    from ministack import app
+
+    if not app.AUTH:
+        return True
+    if not _iot_role_usable(role_arn):
+        return False
+    from ministack.core.iam_evaluator import (
+        EvalContext,
+        _gather_role_policies,
+        _permissions_boundary,
+        evaluate,
+    )
+    from ministack.services import iam as _iam
+
+    account = get_account_id()
+    role_name = role_arn.rsplit("/", 1)[-1]
+    policies = _gather_role_policies(role_name, account)
+    limits = _permissions_boundary(_iam._roles, role_name, account)
+    principal = f"arn:aws:sts::{account}:assumed-role/{role_name}/IoTProvisioning"
+    for action, resource in requests:
+        ctx = EvalContext(
+            principal_arn=principal,
+            principal_type="AssumedRole",
+            principal_account=account,
+            action=action,
+            resource_arn=resource,
+            region=get_region(),
+        )
+        if evaluate(ctx, policies, *limits).decision != "Allow":
+            return False
+    return True
 
 
 def _provisioning_thing_changes(
@@ -2582,12 +2880,14 @@ def _provisioning_thing_changes(
 def _certificate_record(
     cert_id: str, cert_pem: str, status: str, ca_id: str | None = None
 ) -> dict:
-    """The registry record of a device certificate, owned by the current scope."""
+    """The registry record of a device certificate, owned by the current scope; it takes its CA's mode."""
+    ca = _ca_certificates.get(ca_id) if ca_id else None
     return {
         "certificateId": cert_id,
         "certificateArn": _cert_arn(cert_id),
         "certificatePem": cert_pem,  # verbatim
         "status": status,
+        "certificateMode": (ca or {}).get("certificateMode", "DEFAULT"),
         "creationDate": _now_epoch(),
         "ownedBy": get_account_id(),
         "caCertificateId": ca_id,
@@ -3286,8 +3586,9 @@ def _handle_thing_principals(method: str, path: str, headers: dict, body: bytes,
         )
     name = middle
     thing = _things.get(name)
+    operation = {"PUT": "AttachThingPrincipal", "DELETE": "DetachThingPrincipal"}.get(method, "ListThingPrincipals")
     if thing is None:
-        return _error_not_found("Thing", name)
+        return _error_not_found(operation, name, principal=headers.get("x-amzn-principal") or qp.get("principal"))
 
     if method == "GET":
         return json_response({"principals": list(thing.get("principals", []))})
@@ -3301,7 +3602,7 @@ def _handle_thing_principals(method: str, path: str, headers: dict, body: bytes,
     cert_id = principal.rsplit("/", 1)[-1]
     cert = _certificates.get(cert_id)
     if cert is None:
-        return _error_not_found("Principal", principal)
+        return _error_not_found(f"{operation}:principal", name, principal=principal)
 
     if method == "PUT":
         if principal not in thing.setdefault("principals", []):
@@ -3334,7 +3635,7 @@ def _list_principal_things(headers: dict, qp: dict) -> tuple:
     cert_id = principal.rsplit("/", 1)[-1]
     cert = _certificates.get(cert_id)
     if cert is None:
-        return _error_not_found("Principal", principal)
+        return _error_not_found("ListPrincipalThings", principal)
     things = []
     for arn in cert.get("attachedThings", []):
         tname = _thing_name_from_arn(arn)
@@ -3436,7 +3737,7 @@ def _create_policy(name: str, payload: dict) -> tuple:
 def _get_policy(name: str) -> tuple:
     p = _policies.get(name)
     if p is None:
-        return _error_not_found("Policy", name)
+        return _error_not_found("GetPolicy", name)
     default_id = p["defaultVersionId"]
     return json_response({
         "policyName": name,
@@ -3523,7 +3824,7 @@ def _get_policy_version(name: str, version_id: str) -> tuple:
         return _error_not_found("Policy", name)
     v = p["versions"].get(version_id)
     if v is None:
-        return _error_not_found("PolicyVersion", version_id)
+        return _error_not_found("PolicyVersion", version_id, policy=name)
     return json_response({
         "policyArn": p["policyArn"],
         "policyDocument": v["document"],
@@ -3554,7 +3855,7 @@ def _delete_policy_version(name: str, version_id: str) -> tuple:
     if p is None:
         return _error_not_found("Policy", name)
     if version_id not in p["versions"]:
-        return _error_not_found("PolicyVersion", version_id)
+        return _error_not_found("PolicyVersion", version_id, policy=name)
     if p["defaultVersionId"] == version_id:
         return error_response_json(
             "DeleteConflictException",
@@ -3577,7 +3878,7 @@ def _set_default_policy_version(name: str, version_id: str) -> tuple:
         )
     p = _policies.get(name)
     if p is None:
-        return _error_not_found("Policy", name)
+        return error_response_json("ResourceNotFoundException", "Policy not found", 404)
     if version_id not in p["versions"]:
         return error_response_json(
             "ResourceNotFoundException",
@@ -3610,6 +3911,9 @@ def _handle_target_policy(method: str, path: str, body: bytes, qp: dict) -> tupl
         return error_response_json(
             "InvalidRequestException", f"Unsupported method: {method}", 400
         )
+    # DetachPolicy of an unknown policy succeeds; DetachPrincipalPolicy refuses it.
+    if method != "PUT" and name not in _policies:
+        return json_response({})
     return _change_policy_target(
         name, _parse_body(body).get("target"), attach=method == "PUT"
     )
@@ -5828,6 +6132,12 @@ def _job_arn(job_id: str) -> str:
     return f"arn:aws:iot:{get_region()}:{get_account_id()}:job/{job_id}"
 
 
+def _job_target_not_found(arn: str) -> str:
+    """AWS's message for a job target thing or thing group that does not exist."""
+    kind, _, name = arn.rpartition(":")[2].partition("/")
+    return f"{'Thing Group' if kind == 'thinggroup' else 'Thing'} {name} cannot be found."
+
+
 def _job_target_resolve(arn: str) -> list[str] | None:
     """Thing names one job target ARN resolves to, under the caller's scope.
 
@@ -5876,7 +6186,8 @@ def _jobs_materialize_executions(job_id: str) -> None:
     SNAPSHOT jobs resolve group membership exactly once (at creation) — the
     `snapshotted` flag latches that. CONTINUOUS jobs re-resolve lazily on
     every read, which is exactly when new membership matters and avoids
-    watching group mutations.
+    watching group mutations. Things in the job's `rolloutQueue` wait for
+    their rollout batch.
     """
     job = _jobs.get(job_id)
     if not job or job.get("status") == "CANCELED":
@@ -5885,9 +6196,10 @@ def _jobs_materialize_executions(job_id: str) -> None:
         return
     now = _jobs_now_ms()
     deleted = job.get("executionsDeletedFor") or ()
+    waiting = set(job.get("rolloutQueue") or ())
     for thing in _job_target_things(job.get("targets")):
         key = (thing, job_id)
-        if key in _job_executions or thing in deleted:
+        if key in _job_executions or thing in deleted or thing in waiting:
             continue
         _jobs_queue_execution(thing, job_id, now)
     if job.get("targetSelection") == "SNAPSHOT":
@@ -5922,6 +6234,97 @@ def _jobs_queue_execution(thing: str, job_id: str, now: int) -> None:
     deleted = (_jobs.get(job_id) or {}).get("executionsDeletedFor")
     if deleted and thing in deleted:
         deleted.remove(thing)
+
+
+# A job with jobExecutionsRolloutConfig creates its executions in batches, one
+# batch per this interval; the things still waiting are in its `rolloutQueue`.
+_JOB_ROLLOUT_INTERVAL_MS = 60_000
+# The running rollout tasks, kept here because the event loop holds only weak references.
+_rollout_tasks: set[asyncio.Task] = set()
+
+
+def _jobs_rollout_batch_size(job: dict, waiting: int) -> int:
+    """How many of `waiting` things a job notifies in its next batch."""
+    config = job.get("jobExecutionsRolloutConfig")
+    config = config if isinstance(config, dict) else {}
+    maximum = config.get("maximumPerMinute")
+    size = maximum if isinstance(maximum, int) and maximum > 0 else waiting
+    rate = config.get("exponentialRate")
+    rate = rate if isinstance(rate, dict) else {}
+    criteria = rate.get("rateIncreaseCriteria")
+    criteria = criteria if isinstance(criteria, dict) else {}
+    if criteria.get("numberOfSucceededThings") is not None:
+        step = criteria["numberOfSucceededThings"]
+        done = _jobs_status_counts(job["jobId"])["SUCCEEDED"]
+    else:
+        step = criteria.get("numberOfNotifiedThings")
+        done = sum(1 for e in _job_executions.values() if e["jobId"] == job["jobId"])
+    base, factor = rate.get("baseRatePerMinute"), rate.get("incrementFactor")
+    if not (
+        isinstance(base, int) and base > 0 and isinstance(step, int) and step > 0
+        and isinstance(factor, (int, float)) and factor > 1
+    ):
+        return size
+    # The rate grows by incrementFactor for every full step of notified (or
+    # succeeded) things, and maximumPerMinute caps it.
+    per_minute = base
+    for _ in range(done // step):
+        if per_minute >= size:
+            break
+        per_minute *= factor
+    return min(size, int(per_minute))
+
+
+def _jobs_rollout_release(job: dict) -> list[tuple[str, str | None]]:
+    """Queue the next batch of a job's waiting things; returns (thing, previous queue front) pairs."""
+    job_id, waiting = job["jobId"], job["rolloutQueue"]
+    batch = waiting[:_jobs_rollout_batch_size(job, len(waiting))]
+    job["rolloutQueue"] = waiting[len(batch):]
+    now = _jobs_now_ms()
+    job["rolloutBatchAt"] = now
+    # A thing deleted meanwhile is skipped, and so is one a CONTINUOUS job no longer targets.
+    targeted = (
+        set(_job_target_things(job.get("targets")))
+        if job.get("targetSelection") == "CONTINUOUS" else _things
+    )
+    released = []
+    for thing in batch:
+        if thing in targeted and (thing, job_id) not in _job_executions:
+            released.append((thing, jobs_first_pending_job_id(thing)))
+            _jobs_queue_execution(thing, job_id, now)
+    _jobs_maybe_complete(job_id)
+    return released
+
+
+async def _jobs_rollout(account_id: str, region: str, job: dict) -> None:
+    """Release a job's waiting things batch by batch until none is left or the job stops."""
+    while True:
+        with request_scope(account_id, region):
+            if (
+                _jobs.get(job["jobId"]) is not job
+                or job["status"] != "IN_PROGRESS"
+                or not job.get("rolloutQueue")
+            ):
+                return
+            wait = job["rolloutBatchAt"] + _JOB_ROLLOUT_INTERVAL_MS - _jobs_now_ms()
+        if wait > 0:
+            await asyncio.sleep(wait / 1000)
+            continue
+        async with publishing_events():
+            with request_scope(account_id, region):
+                released = _jobs_rollout_release(job)
+            for thing, prev_next in released:
+                await jobs_notify_thing(account_id, region, thing, prev_next)
+
+
+def _jobs_rollout_start(account_id: str, region: str, job: dict) -> None:
+    """Run a job's rollout on the running event loop, if there is one."""
+    try:
+        task = asyncio.get_running_loop().create_task(_jobs_rollout(account_id, region, job))
+    except RuntimeError:
+        return
+    _rollout_tasks.add(task)
+    task.add_done_callback(_rollout_tasks.discard)
 
 
 def _jobs_thing_joined_group(thing: str, group_arn: str) -> bool:
@@ -6131,6 +6534,8 @@ def _jobs_apply_timeout(execution: dict) -> dict:
     execution["versionNumber"] += 1
     _job_execution_event(execution)
     _jobs_maybe_complete(execution["jobId"])
+    # A read sends no jobs/notify, so the things an abort cancels here are not notified.
+    _jobs_abort(execution["jobId"])
     return execution
 
 
@@ -6147,6 +6552,7 @@ def _jobs_maybe_complete(job_id: str) -> None:
         not job
         or job.get("targetSelection") == "CONTINUOUS"
         or job.get("status") != "IN_PROGRESS"
+        or job.get("rolloutQueue")
     ):
         return
     executions = [e for e in _job_executions.values() if e["jobId"] == job_id]
@@ -6156,6 +6562,43 @@ def _jobs_maybe_complete(job_id: str) -> None:
         job["completedAt"] = now
         job["lastUpdatedAt"] = now
         _job_event(job, "completed")
+
+
+# The execution statuses each abortConfig failureType counts.
+_JOB_ABORT_FAILURE_STATUSES = {
+    "FAILED": ("FAILED",), "REJECTED": ("REJECTED",), "TIMED_OUT": ("TIMED_OUT",),
+    "ALL": ("FAILED", "REJECTED", "TIMED_OUT"),
+}
+
+
+def _jobs_abort(job_id: str) -> dict:
+    """Cancel an IN_PROGRESS job once a criterion of its abortConfig is met; returns _jobs_cancel's mapping."""
+    job = _jobs.get(job_id)
+    criteria = ((job or {}).get("abortConfig") or {}).get("criteriaList") or []
+    if not criteria or job.get("status") != "IN_PROGRESS":
+        return {}
+    counts = _jobs_status_counts(job_id)
+    # Every terminal execution counts as completed, CANCELED and REMOVED ones included.
+    completed = sum(counts[status] for status in _JOB_EXECUTION_TERMINAL)
+    for criterion in criteria:
+        failure_type = criterion.get("failureType")
+        threshold = criterion.get("thresholdPercentage")
+        minimum = criterion.get("minNumberOfExecutedThings")
+        if (
+            criterion.get("action") != "CANCEL"
+            or failure_type not in _JOB_ABORT_FAILURE_STATUSES
+            or not isinstance(threshold, (int, float))
+            or not isinstance(minimum, int)
+        ):
+            continue
+        failed = sum(counts[status] for status in _JOB_ABORT_FAILURE_STATUSES[failure_type])
+        if completed >= max(minimum, 1) and failed * 100 >= threshold * completed:
+            comment = (
+                f"Abort criteria for failure type {failure_type} with threshold {threshold:.2f}% met. "
+                f"Total completed executions: {completed}, total {failure_type} executions: {failed}"
+            )
+            return _jobs_cancel(job_id, {"comment": comment, "reasonCode": "ABORT_CANCEL"}, False)
+    return {}
 
 
 def _jobs_check_expected_version(
@@ -6191,15 +6634,21 @@ def _jobs_check_expected_version(
     return None
 
 
-def _jobs_reject_if_terminal(execution: dict, verb: str) -> tuple | None:
+def _jobs_reject_if_terminal(execution: dict, message: str) -> tuple | None:
     """Terminal executions are frozen — no update, no cancel."""
     if execution["status"] not in _JOB_EXECUTION_TERMINAL:
         return None
+    return error_response_json("InvalidStateTransitionException", message, 409)
+
+
+def jobs_reject_terminal_describe(execution: dict) -> tuple | None:
+    """The device plane describes only QUEUED and IN_PROGRESS executions."""
+    if execution["status"] not in _JOB_EXECUTION_TERMINAL:
+        return None
     return error_response_json(
-        "InvalidStateTransitionException",
-        f"Job execution is in terminal status {execution['status']} and "
-        f"cannot be {verb}",
-        409,
+        "TerminalStateException",
+        "Job Execution has reached terminal state. It is neither IN_PROGRESS nor QUEUED",
+        410,
     )
 
 
@@ -6338,6 +6787,16 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
             "Invalid jobId: must match [a-zA-Z0-9_-]{1,64}",
             400,
         )
+    abort = payload.get("abortConfig")
+    if violations := _job_update_violations(job_id, {"abortConfig": abort}):
+        return _job_validation_error(violations)
+    timeout_cfg = payload.get("timeoutConfig") or {}
+    if timeout_cfg:
+        err = _job_timeout_error(timeout_cfg.get("inProgressTimeoutInMinutes"))
+        if err:
+            return err
+    if err := _job_abort_criteria_error(abort):
+        return err
     if job_id in _jobs:
         return error_response_json(
             "ResourceAlreadyExistsException", f"Job {job_id} already exists", 409
@@ -6382,11 +6841,6 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
                 "follow the format YYYY-MM-DDThh:mm.",
                 400,
             )
-    timeout_cfg = payload.get("timeoutConfig") or {}
-    if timeout_cfg:
-        err = _job_timeout_error(timeout_cfg.get("inProgressTimeoutInMinutes"))
-        if err:
-            return err
     targets = payload.get("targets")
     if not targets:
         return error_response_json(
@@ -6406,7 +6860,7 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
         resolved = _job_target_resolve(arn)
         if resolved is None:
             return error_response_json(
-                "ResourceNotFoundException", f"Job target {arn} not found", 404
+                "ResourceNotFoundException", _job_target_not_found(arn), 404
             )
         target_things.update(resolved)
     document = payload.get("document")
@@ -6455,7 +6909,7 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
         "presignedUrlConfig": payload.get("presignedUrlConfig") or {},
         "jobExecutionsRolloutConfig": payload.get("jobExecutionsRolloutConfig")
         or {},
-        # Stored so DescribeJob echoes them. timeoutConfig is acted on; nothing aborts.
+        # Stored so DescribeJob echoes them. abortConfig and timeoutConfig are acted on.
         "abortConfig": payload.get("abortConfig"),
         "timeoutConfig": payload.get("timeoutConfig"),
         "jobExecutionsRetryConfig": payload.get("jobExecutionsRetryConfig"),
@@ -6467,6 +6921,12 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
         "snapshotted": False,
     }
     _set_created_tags(_job_arn(job_id), payload.get("tags"))
+    things = _job_target_things(targets)
+    batch = _jobs_rollout_batch_size(_jobs[job_id], len(things))
+    if batch < len(things):
+        # The other things wait for later batches of the rollout.
+        _jobs[job_id].update(rolloutQueue=things[batch:], rolloutBatchAt=now)
+        _jobs_rollout_start(get_account_id(), get_region(), _jobs[job_id])
     _jobs_materialize_executions(job_id)
     # New QUEUED executions joined each target's pending set — notify, as AWS
     # does (notify-next only reaches the things whose queue front changed).
@@ -6494,10 +6954,12 @@ _JOB_ROLE_ARN_RE = re.compile(r"^arn:aws[a-z-]*:iam::\d{12}:role/.+$")
 
 
 def _job_update_violations(job_id: str, payload: dict) -> list[str]:
-    """Model constraint failures of an UpdateJob request."""
+    """Model constraint failures of an UpdateJob request; CreateJob and CreateJobTemplate check abortConfig with it."""
     found: list[str] = []
 
-    def bound(value, member, low=None, high=None, double=False):
+    def bound(value, member, low=None, high=None, double=False, required=False):
+        if value is None and required:
+            found.append(_job_validation_clause(None, member, "Member must not be null"))
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             return
         shown = float(value) if double else value
@@ -6508,7 +6970,9 @@ def _job_update_violations(job_id: str, payload: dict) -> list[str]:
             found.append(_job_validation_clause(
                 shown, member, f"Member must have value less than or equal to {high}"))
 
-    def enum(value, member, allowed):
+    def enum(value, member, allowed, required=False):
+        if value is None and required:
+            found.append(_job_validation_clause(None, member, "Member must not be null"))
         if value is not None and value not in allowed:
             found.append(_job_validation_clause(
                 value, member, f"Member must satisfy enum value set: {allowed}"))
@@ -6570,15 +7034,43 @@ def _job_update_violations(job_id: str, payload: dict) -> list[str]:
         at = f"jobExecutionsRetryConfig.criteriaList.{i}.member"
         bound(c.get("numberOfRetries"), f"{at}.numberOfRetries", low=0, high=10)
         enum(c.get("failureType"), f"{at}.failureType", "[ALL, TIMED_OUT, FAILED]")
-    for i, c in enumerate(criteria_list(payload.get("abortConfig"),
-                                        "abortConfig.criteriaList"), 1):
+    abort = payload.get("abortConfig")
+    if isinstance(abort, dict) and abort.get("criteriaList") is None:
+        found.append(_job_validation_clause(
+            None, "abortConfig.criteriaList", "Member must not be null"))
+    for i, c in enumerate(criteria_list(abort, "abortConfig.criteriaList"), 1):
         at = f"abortConfig.criteriaList.{i}.member"
-        bound(c.get("minNumberOfExecutedThings"), f"{at}.minNumberOfExecutedThings", low=1)
-        enum(c.get("failureType"), f"{at}.failureType", "[ALL, TIMED_OUT, FAILED, REJECTED]")
-        enum(c.get("action"), f"{at}.action", "[CANCEL]")
+        bound(c.get("minNumberOfExecutedThings"), f"{at}.minNumberOfExecutedThings", low=1,
+              required=True)
+        enum(c.get("failureType"), f"{at}.failureType", "[ALL, TIMED_OUT, FAILED, REJECTED]",
+             required=True)
+        enum(c.get("action"), f"{at}.action", "[CANCEL]", required=True)
         bound(c.get("thresholdPercentage"), f"{at}.thresholdPercentage", high=100,
-              double=True)
+              double=True, required=True)
     return found
+
+
+def _job_abort_criteria_error(abort) -> tuple | None:
+    """The abortConfig checks that follow the model constraints, criterion by criterion."""
+    criteria = abort.get("criteriaList") if isinstance(abort, dict) else None
+    seen = set()
+    for c in criteria if isinstance(criteria, list) else []:
+        if not isinstance(c, dict):
+            continue
+        threshold = c.get("thresholdPercentage")
+        numeric = isinstance(threshold, (int, float)) and not isinstance(threshold, bool)
+        message = None
+        if c.get("failureType") in seen:
+            message = "Multiple AbortCriteria cannot have the same failure type"
+        elif numeric and threshold <= 0:
+            message = (f"ThresholdPercentage value {float(threshold)} for AbortCriteria "
+                       "must have value greater than 0")
+        elif numeric and round(threshold, 2) != threshold:
+            message = "Abort thresholdPercentage must have two or less decimal digits"
+        if message:
+            return error_response_json("InvalidRequestException", message, 400)
+        seen.add(c.get("failureType"))
+    return None
 
 
 def _job_update_request_error(job_id: str, payload: dict) -> tuple | None:
@@ -6596,6 +7088,8 @@ def _job_update_request_error(job_id: str, payload: dict) -> tuple | None:
             (payload["timeoutConfig"] or {}).get("inProgressTimeoutInMinutes"))
         if err:
             return err
+    if err := _job_abort_criteria_error(payload.get("abortConfig")):
+        return err
     rollout = payload.get("jobExecutionsRolloutConfig")
     if isinstance(rollout, dict):
         maximum, rate = rollout.get("maximumPerMinute"), rollout.get("exponentialRate")
@@ -6757,10 +7251,10 @@ def _describe_job(job_id: str) -> tuple:
     job_doc["schedulingConfig"] = job.get("schedulingConfig") or {}
     # isConcurrent is false in every steady state (captured eu-north-1
     # 2026-09-19 with a QUEUED, an IN_PROGRESS and a SUCCEEDED execution). It is
-    # true only inside the rollout/cancel window the reference describes, which
-    # this emulator does not model. processingTargets is null throughout the same
+    # true while a rollout still has things to notify; the cancel window the
+    # reference also describes is not modeled. processingTargets is null throughout the same
     # capture, so it stays omitted rather than echoing the target ARNs.
-    job_doc["isConcurrent"] = False
+    job_doc["isConcurrent"] = job["status"] == "IN_PROGRESS" and bool(job.get("rolloutQueue"))
     response = {"job": job_doc}
     if job.get("documentSource") is not None:
         response["documentSource"] = job["documentSource"]
@@ -6926,10 +7420,12 @@ def _handle_job_template(method: str, path: str, body: bytes) -> tuple:
 
 
 def _create_job_template(template_id: str, payload: dict) -> tuple:
+    abort = payload.get("abortConfig")
+    violations = _job_update_violations(template_id, {"abortConfig": abort})
     if payload.get("description") is None:
-        return _job_template_validation_error(
-            None, "description", "Member must not be null"
-        )
+        violations.insert(0, _job_validation_clause(None, "description", "Member must not be null"))
+    if violations:
+        return _job_validation_error(violations)
     document = payload.get("document")
     if isinstance(document, str) and len(document) > 32768:
         return _job_template_validation_error(
@@ -6937,6 +7433,8 @@ def _create_job_template(template_id: str, payload: dict) -> tuple:
         )
     minutes = (payload.get("timeoutConfig") or {}).get("inProgressTimeoutInMinutes")
     if minutes is not None and (err := _job_timeout_error(minutes)):
+        return err
+    if err := _job_abort_criteria_error(abort):
         return err
     source = payload.get("documentSource")
     if document and source:
@@ -7140,21 +7638,12 @@ def _job_payload_from_template(payload: dict) -> tuple[dict | None, tuple | None
     return merged, None
 
 
-async def _cancel_job(job_id: str, payload: dict, qp: dict) -> tuple:
-    job = _jobs.get(job_id)
-    if job is None:
-        return _error_not_found("Job", job_id)
-    if job["status"] != "IN_PROGRESS":
-        return error_response_json(
-            "InvalidRequestException",
-            f"Job {job_id} is in status {job['status']} and cannot be canceled",
-            400,
-        )
-    force = _qp_bool(qp, "force")
+def _jobs_cancel(job_id: str, payload: dict, force: bool) -> dict:
+    """CancelJob's state change; maps each thing whose execution it canceled to its earlier queue front."""
+    job = _jobs[job_id]
     now = _jobs_now_ms()
     job["status"] = "CANCELED"
-    if force:
-        job["forceCanceled"] = True
+    job["forceCanceled"] = force
     job["lastUpdatedAt"] = now
     job["completedAt"] = now
     if payload.get("comment") is not None:
@@ -7185,9 +7674,23 @@ async def _cancel_job(job_id: str, payload: dict, qp: dict) -> tuple:
             _job_execution_event(execution, force_canceled=force)
             canceled_things.add(execution["thingName"])
     _job_event(job, "canceled")
+    return {thing_name: prev_next[thing_name] for thing_name in canceled_things}
+
+
+async def _cancel_job(job_id: str, payload: dict, qp: dict) -> tuple:
+    job = _jobs.get(job_id)
+    if job is None:
+        return _error_not_found("Job", job_id)
+    if job["status"] != "IN_PROGRESS":
+        return error_response_json(
+            "InvalidRequestException",
+            f"Job {job_id} is in status {job['status']} and cannot be canceled",
+            400,
+        )
+    canceled = _jobs_cancel(job_id, payload, _qp_bool(qp, "force"))
     account_id, region = get_account_id(), get_region()
-    for thing_name in sorted(canceled_things):
-        await jobs_notify_thing(account_id, region, thing_name, prev_next[thing_name])
+    for thing_name in sorted(canceled):
+        await jobs_notify_thing(account_id, region, thing_name, canceled[thing_name])
     response = {"jobArn": job["jobArn"], "jobId": job_id}
     if job.get("description") is not None:
         response["description"] = job["description"]
@@ -7331,7 +7834,7 @@ def _describe_job_execution(thing: str, job_id: str, qp: dict) -> tuple:
             None,
         )
     if execution is None:
-        return _error_not_found("Job execution", f"{thing}/{job_id}")
+        return _error_not_found("JobExecution" if job_id in _jobs else "JobExecution:job", job_id, thing=thing)
     view = {
         "jobId": execution["jobId"],
         "status": execution["status"],
@@ -7355,13 +7858,15 @@ async def _cancel_job_execution(
     _jobs_materialize_executions(job_id)
     execution = _job_executions.get((thing, job_id))
     if execution is None:
-        return _error_not_found("Job execution", f"{thing}/{job_id}")
+        return _error_not_found("JobExecution" if job_id in _jobs else "JobExecution:job", job_id, thing=thing)
     error = _jobs_check_expected_version(
         execution, payload.get("expectedVersion"), "VersionConflictException"
     )
     if error:
         return error
-    error = _jobs_reject_if_terminal(execution, "canceled")
+    error = _jobs_reject_if_terminal(
+        execution, f"Job execution for thing {thing} within job {job_id} cannot be canceled."
+    )
     if error:
         return error
     force = _qp_bool(qp, "force")
@@ -7380,6 +7885,7 @@ async def _cancel_job_execution(
     _job_execution_event(execution, force_canceled=force)
     _jobs_maybe_complete(job_id)
     await jobs_notify_thing(get_account_id(), get_region(), thing, prev_next)
+    await jobs_abort_if_met(get_account_id(), get_region(), job_id)
     return json_response({})
 
 
@@ -7439,6 +7945,7 @@ async def _delete_job_execution(thing: str, job_id: str, number: str, qp: dict) 
     _jobs_maybe_complete(job_id)
     if pending:
         await jobs_notify_thing(get_account_id(), get_region(), thing, prev_next)
+    await jobs_abort_if_met(get_account_id(), get_region(), job_id)
     return 200, {}, b""
 
 
@@ -7581,6 +8088,37 @@ _JOB_PRESIGN_SESSION_REUSE_SECONDS = 3600
 _jobs_presign_sessions: dict[tuple[str, str], str] = {}
 
 
+def _iot_role_usable(role_arn: str) -> bool:
+    """Under AUTH=true, whether the role exists in the caller's account and its trust policy lets IoT assume it."""
+    from ministack import app
+
+    if not app.AUTH:
+        return True
+    from ministack.core.iam_evaluator import _action_matches, _service_principal_matches
+    from ministack.services import iam as _iam
+
+    parts = role_arn.split(":", 5)
+    if len(parts) != 6 or parts[4] != get_account_id() or not parts[5].startswith("role/"):
+        return False
+    role = _iam._roles.get(parts[5].rsplit("/", 1)[-1])
+    try:
+        statements = json.loads((role or {}).get("AssumeRolePolicyDocument") or "{}").get("Statement", [])
+    except (ValueError, AttributeError):
+        return False
+    allowed = False
+    for stmt in statements if isinstance(statements, list) else [statements]:
+        if not isinstance(stmt, dict) or not _service_principal_matches(stmt.get("Principal"), "iot.amazonaws.com"):
+            continue
+        actions, not_actions = stmt.get("Action", []), stmt.get("NotAction", [])
+        if not _action_matches("sts:AssumeRole", [actions] if isinstance(actions, str) else actions,
+                               [not_actions] if isinstance(not_actions, str) else not_actions):
+            continue
+        if stmt.get("Effect") == "Deny":
+            return False
+        allowed = allowed or stmt.get("Effect") == "Allow"
+    return allowed
+
+
 def _jobs_presign_session(role_arn: str, expires: int) -> tuple[str, dict]:
     """A session of the presign role, registered with STS, that outlives a URL signed now."""
     from ministack.services import iam as _iam
@@ -7614,7 +8152,7 @@ def _jobs_presigned_document(job: dict) -> str:
     config = job.get("presignedUrlConfig")
     if "${aws:iot:s3-presigned-url" not in document or not (
         isinstance(config, dict) and config.get("roleArn")
-    ):
+    ) or not _iot_role_usable(config["roleArn"]):
         return document
     from ministack.core.sigv4 import (
         build_canonical_query_string,
@@ -7708,7 +8246,7 @@ def jobs_update_execution(
     if execution is None:
         return None, error_response_json(
             "ResourceNotFoundException",
-            f"No job execution found for thing {thing_name} and job {job_id}",
+            f"Job {job_id} not found for {thing_name}",
             404,
         )
     error = _jobs_check_expected_version(
@@ -7716,20 +8254,11 @@ def jobs_update_execution(
     )
     if error:
         return None, error
-    error = _jobs_reject_if_terminal(execution, "updated")
-    if error:
-        return None, error
     if not status or status not in _JOB_EXECUTION_STATUSES:
         return None, error_response_json(
             "InvalidRequestException",
             f"Invalid job execution status: {status!r}",
             400,
-        )
-    if status == "QUEUED":
-        return None, error_response_json(
-            "InvalidStateTransitionException",
-            "A device cannot move a job execution back to QUEUED",
-            409,
         )
     if status not in _DEVICE_SETTABLE_STATUSES:
         # InvalidStateTransitionException, not InvalidRequestException
@@ -7739,11 +8268,18 @@ def jobs_update_execution(
             f"The status of job execution cannot be changed to be {status}",
             409,
         )
+    error = _jobs_reject_if_terminal(
+        execution,
+        f"Job {job_id} for {thing_name} has already finished with status {execution['status']}",
+    )
+    if error:
+        return None, error
     now = _jobs_now_ms()
     execution["status"] = status
     if status_details:
         execution["statusDetails"] = dict(status_details)
-    if status == "IN_PROGRESS" and execution.get("startedAt") is None:
+    # The first report starts the execution, unless the device rejects the job.
+    if status != "REJECTED" and execution.get("startedAt") is None:
         execution["startedAt"] = now
     if status == "IN_PROGRESS" and step_timeout_minutes is not None:
         # The device's own step timeout, reset every time it re-reports
@@ -7756,6 +8292,14 @@ def jobs_update_execution(
         _job_execution_event(execution)
     _jobs_maybe_complete(job_id)
     return dict(execution), None
+
+
+async def jobs_abort_if_met(account_id: str, region: str, job_id: str) -> None:
+    """Apply the job's abortConfig after an execution finished, notifying the things whose execution it canceled."""
+    with request_scope(account_id, region):
+        canceled = _jobs_abort(job_id)
+    for thing_name in sorted(canceled):
+        await jobs_notify_thing(account_id, region, thing_name, canceled[thing_name])
 
 
 def jobs_execution_view(execution: dict, document: str | dict | None) -> dict:
@@ -8067,10 +8611,10 @@ def delete_thing_shadow(thing_name: str, shadow_name: str) -> tuple:
 # property blocks on every packet that carries one, all four fields of the
 # subscription-options byte (QoS, No Local, Retain As Published, Retain
 # Handling), v5 reason codes on CONNACK/SUBACK/PUBACK/UNSUBACK/DISCONNECT, an
-# assigned client identifier, and pass-through of the PUBLISH properties a
-# subscriber may echo back. Out of scope, and advertised as unavailable in
-# CONNACK where the protocol has a flag for it: shared subscriptions, topic
-# aliases, message expiry, flow control (receive maximum), subscription
+# assigned client identifier, message expiry, and pass-through of the
+# PUBLISH properties a subscriber may echo back. Out of scope, and advertised
+# as unavailable in CONNACK where the protocol has a flag for it: shared
+# subscriptions, topic aliases, flow control (receive maximum), subscription
 # identifiers, and request/response semantics beyond forwarding the
 # properties untouched. Properties this broker does not model are parsed and
 # ignored, never echoed back.
@@ -8122,7 +8666,8 @@ class _PersistentSessionState:
         session_identifier: str | None = None,
     ):
         self.subscriptions: list[str] = subscriptions
-        self.queued_messages: list[tuple[str, bytes, int]] = []
+        # (topic, payload, qos, PUBLISH properties, time the broker received it)
+        self.queued_messages: list[tuple[str, bytes, int, bytes, float]] = []
         self.created_at: float = created_at
         # Seconds this session outlives its connection, as the client asked
         # for it in the MQTT 5 Session Expiry Interval. None means the client
@@ -8947,14 +9492,16 @@ def _jobs_error_tuple_to_rejected(
         code = "ResourceNotFound"
     elif status == 400:
         code = "InvalidRequest"
+    elif status == 410:
+        code = "TerminalStateReached"
     elif message.startswith("Expected version"):
         code = "VersionMismatch"
-    elif "terminal status" in message:
-        code = "TerminalStateReached"
     else:
         code = "InvalidStateTransition"
     execution_state = None
-    if code in ("VersionMismatch", "InvalidStateTransition") and execution is not None:
+    # A refused status carries no executionState.
+    refused_status = message.startswith("The status of job execution cannot be changed")
+    if code in ("VersionMismatch", "InvalidStateTransition") and execution is not None and not refused_status:
         execution_state = {
             "status": execution["status"],
             "versionNumber": execution["versionNumber"],
@@ -9072,10 +9619,14 @@ async def _handle_jobs_publish(
                 "rejected",
                 _jobs_rejected(
                     "ResourceNotFound",
-                    f"No job execution found for thing {thing} and job {job_id}",
+                    f"Job {job_id} not found for {thing}",
                     client_token,
                 ),
             )
+            return
+        error = jobs_reject_terminal_describe(execution) if execution is not None else None
+        if error:
+            await _respond("rejected", _jobs_error_tuple_to_rejected(error, client_token))
             return
         # An idle thing's "$next" mirrors the HTTP plane's empty structure.
         doc = {"timestamp": ts}
@@ -9119,6 +9670,7 @@ async def _handle_jobs_publish(
         # publishes update/accepted first, then notify + notify-next
         # (live-captured order) — which the _respond above just preserved.
         await jobs_notify_thing(account_id, region, thing, prev_next)
+        await jobs_abort_if_met(account_id, region, job_id)
 
 
 def _shadow_rejected(status: int, message: str, client_token: str | None = None) -> dict:
@@ -9307,14 +9859,11 @@ async def broker_publish(
     properties: bytes = b"",
     client_id: str | None = None,
     principal: str | None = None,
-) -> int:
+) -> None:
     """Deliver a message to every matching subscriber.
 
     ``properties`` is an encoded MQTT 5 property block forwarded verbatim to
-    v5 subscribers (empty for a 3.1.1 publisher or an HTTP publish). Returns
-    how many recipients the message reached — subscribers delivered to plus
-    offline persistent sessions it was queued for — which is what an MQTT 5
-    PUBACK reports as Success versus No matching subscribers.
+    v5 subscribers (empty for a 3.1.1 publisher or an HTTP publish).
 
     ``client_id`` names the publishing MQTT client, which is what a No Local
     subscription is defined against (§3.8.3.1): that subscriber does not want
@@ -9325,7 +9874,6 @@ async def broker_publish(
     ``principal`` is who published the message, what the rule SQL
     ``principal()`` returns; rules also see a fresh trace id per message.
     """
-    delivered = 0
     # Basic Ingest: a publish to `$aws/rules/<ruleName>` is delivered straight
     # to that rule's actions and bypasses pub/sub delivery entirely.
     if topic.startswith(_BASIC_INGEST_PREFIX):
@@ -9342,20 +9890,21 @@ async def broker_publish(
                 remainder[1] if len(remainder) > 1 else "",
                 client_id,
             )
-        return delivered
+        return
 
     scoped = _scoped_topic(account_id, region, topic)
+    received_at = time.time()
 
     if retain:
         if not payload:
             _retained.pop(scoped, None)
         else:
-            _retained[scoped] = _RetainedMessage(scoped, payload, qos, properties)
+            _retained[scoped] = _RetainedMessage(scoped, payload, qos, properties, received_at)
 
     async with _broker_lock:
         subs = [s for sset in _subscriptions.values() for s in sset]
 
-    token = _delivery_properties.set(properties)
+    token = _delivery_properties.set(_aged_properties(properties, received_at, received_at) or b"")
     try:
         for sub in subs:
             if sub.account_id != account_id or sub.region != region:
@@ -9378,7 +9927,6 @@ async def broker_publish(
                         payload,
                         effective_qos,
                     )
-                    delivered += 1
                 except Exception:
                     _broker_logger.exception("IoT broker: subscriber %s delivery failed", sub.subscription_id)
                 finally:
@@ -9397,10 +9945,9 @@ async def broker_publish(
                 continue
             for filt in ps.subscriptions:
                 if _subscription_matches(filt, topic):
-                    ps.queued_messages.append((topic, payload, qos))
+                    ps.queued_messages.append((topic, payload, qos, properties, received_at))
                     if len(ps.queued_messages) > _MAX_QUEUED_MESSAGES:
                         ps.queued_messages = ps.queued_messages[-_MAX_QUEUED_MESSAGES:]
-                    delivered += 1
                     break
 
     with _rule_message_scope(principal):
@@ -9437,8 +9984,6 @@ async def broker_publish(
             _broker_logger.warning(
                 "IoT jobs bridge failed for %r", topic, exc_info=True
             )
-
-    return delivered
 
 
 async def broker_subscribe(
@@ -9492,7 +10037,10 @@ async def broker_subscribe(
             retained_to_send = []
 
     for r in retained_to_send:
-        token = _delivery_properties.set(r.properties)
+        properties = _aged_properties(r.properties, r.ts)
+        if properties is None:
+            continue
+        token = _delivery_properties.set(properties)
         # §3.3.1.3: a message sent because a subscription was established
         # carries RETAIN 1 whatever the subscription's Retain As Published
         # says — that flag is how the client tells this apart from live
@@ -9522,13 +10070,21 @@ async def broker_unsubscribe(subscription_id: str) -> None:
 
 
 def broker_get_retained(account_id: str, region: str, topic: str) -> "_RetainedMessage | None":
-    """The retained message stored for ``topic``, or None."""
-    return _retained.get(_scoped_topic(account_id, region, topic))
+    """The retained message stored for ``topic``, or None; an expired one is dropped here."""
+    scoped = _scoped_topic(account_id, region, topic)
+    msg = _retained.get(scoped)
+    if msg is not None and msg.expired(time.time()):
+        _retained.pop(scoped, None)
+        return None
+    return msg
 
 
 def broker_list_retained(account_id: str, region: str) -> list[tuple[str, "_RetainedMessage"]]:
     """``(topic, message)`` for every retained message here, most recently stored first."""
     prefix = f"{account_id}/{region}/"
+    now = time.time()
+    for key in [k for k, m in _retained.items() if k.startswith(prefix) and m.expired(now)]:
+        del _retained[key]
     found = [(k[len(prefix):], m) for k, m in _retained.items() if k.startswith(prefix)]
     found.sort(key=lambda item: item[1].ts, reverse=True)
     return found
@@ -9669,7 +10225,6 @@ CONNACK_311_NOT_AUTHORIZED = 0x05
 # MQTT 5 reason codes, only the ones this broker produces (§2.4). Success and
 # Normal disconnection share the value 0x00.
 RC5_SUCCESS = 0x00
-RC5_NO_MATCHING_SUBSCRIBERS = 0x10
 RC5_NO_SUBSCRIPTION_EXISTED = 0x11
 RC5_MALFORMED_PACKET = 0x81
 RC5_NOT_AUTHORIZED = 0x87
@@ -9749,7 +10304,8 @@ _PROPERTY_TYPES: dict[int, str] = {
     PROP_SHARED_SUBSCRIPTION_AVAILABLE: "byte",
 }
 
-# PUBLISH properties handed on to subscribers unchanged. §3.3.2.3 requires a
+# PUBLISH properties handed on to subscribers unchanged, except the expiry
+# interval, which loses the time the message waited. §3.3.2.3 requires a
 # server to forward these, and a request/response client depends on getting
 # its own response topic and correlation data back. Everything else a
 # publisher sends (topic alias, subscription identifier, anything this broker
@@ -9762,6 +10318,9 @@ _FORWARDED_PUBLISH_PROPERTIES = frozenset({
     PROP_CORRELATION_DATA,
     PROP_USER_PROPERTY,
 })
+
+# AWS IoT Core counts a Message Expiry Interval of 0 as 1 and caps it at seven days.
+_MESSAGE_EXPIRY_MAX = 604800
 
 # MQTT 5 PUBLISH properties ride a contextvar rather than the subscriber
 # callback signature. ``deliver(topic, payload, qos)`` is the broker's
@@ -9974,6 +10533,40 @@ def _forwardable_publish_properties(props: list[tuple[int, object]]) -> bytes:
     if not kept:
         return b""
     return _encode_properties(kept)
+
+
+def _expiry_interval(props: list[tuple[int, object]]) -> int | None:
+    """The Message Expiry Interval among decoded PUBLISH properties, as AWS IoT Core bounds it."""
+    interval = _property_value(props, PROP_MESSAGE_EXPIRY_INTERVAL, None)
+    if interval is None:
+        return None
+    return min(max(int(interval), 1), _MESSAGE_EXPIRY_MAX)  # type: ignore[arg-type]
+
+
+def _message_expires_at(properties: bytes, received_at: float) -> float | None:
+    """When a message with this PUBLISH property block expires, or None if it never does."""
+    if not properties:
+        return None
+    interval = _expiry_interval(_decode_properties(properties, 0)[0])
+    return None if interval is None else received_at + interval
+
+
+def _aged_properties(properties: bytes, received_at: float, now: float | None = None) -> bytes | None:
+    """``properties`` with the expiry interval lowered to the whole seconds left, None once expired."""
+    if not properties:
+        return properties
+    props, _ = _decode_properties(properties, 0)
+    interval = _expiry_interval(props)
+    if interval is None:
+        return properties
+    left = received_at + interval - (time.time() if now is None else now)
+    if left <= 0:
+        return None
+    # A started second counts as spent: 60 goes out as 59, and 999 ms left as 0.
+    seconds = math.ceil(left) - 1
+    return _encode_properties(
+        [(i, seconds if i == PROP_MESSAGE_EXPIRY_INTERVAL else v) for i, v in props]
+    )
 
 
 def _make_connack(
@@ -10324,6 +10917,11 @@ class _WSSession:
 
     def _publish_allowed(self, topic: str, retain: bool) -> bool:
         """iot:Publish on the topic, and iot:RetainPublish too for a retained message."""
+        from ministack import app
+
+        if app.AUTH and self.certificate_id is None and _parse_fleet_provisioning_topic(topic):
+            # Fleet provisioning writes the registry: under AUTH=true it needs an authenticated device.
+            return False
         resource = f"topic/{topic}"
         return self._policy_allows("iot:Publish", resource) and (
             not retain or self._policy_allows("iot:RetainPublish", resource)
@@ -10558,8 +11156,15 @@ class _WSSession:
                     )
                     queued = existing_ps.queued_messages[:]
                     existing_ps.queued_messages.clear()
-                    for q_topic, q_payload, q_qos in queued:
-                        await self.deliver_to_client(q_topic, q_payload, q_qos)
+                    for q_topic, q_payload, q_qos, q_properties, q_received_at in queued:
+                        properties = _aged_properties(q_properties, q_received_at)
+                        if properties is None:
+                            continue
+                        token = _delivery_properties.set(properties)
+                        try:
+                            await self.deliver_to_client(q_topic, q_payload, q_qos)
+                        finally:
+                            _delivery_properties.reset(token)
                     await self._publish_connected()
                     return True
                 else:
@@ -10602,6 +11207,12 @@ class _WSSession:
                 if self.protocol_version == MQTT_5:
                     await self.send_bytes(_make_disconnect(RC5_NOT_AUTHORIZED))
                 return False
+            if self.provisioning_template is not None and _mtls_claim_scope(self.certificate_id) is None:
+                # AWS acknowledges a PUBLISH on an expired claim's connection, then closes it.
+                _broker_logger.warning("IoT broker: the provisioning claim of %r has expired", self._client_id)
+                if qos == 1 and packet_id is not None:
+                    await self.send_bytes(_make_puback(packet_id))
+                return await self._close_unauthorized()
             if not self._publish_allowed(topic, retain):
                 # MQTT 5 answers a refused QoS 1 PUBLISH with PUBACK 0x87 and
                 # keeps the connection.
@@ -10613,7 +11224,7 @@ class _WSSession:
                     return True
                 return await self._close_unauthorized()
             payload = body[off:]
-            delivered = await broker_publish(
+            await broker_publish(
                 self.account_id,
                 self.region,
                 topic,
@@ -10625,9 +11236,9 @@ class _WSSession:
                 principal=self._principal,
             )
             if qos == 1 and packet_id is not None:
+                # Success also when nobody subscribes, as AWS IoT answers.
                 if self.protocol_version == MQTT_5:
-                    reason = RC5_SUCCESS if delivered else RC5_NO_MATCHING_SUBSCRIBERS
-                    await self.send_bytes(_make_puback(packet_id, reason_code=reason))
+                    await self.send_bytes(_make_puback(packet_id, reason_code=RC5_SUCCESS))
                 else:
                     await self.send_bytes(_make_puback(packet_id))
             fleet = _parse_fleet_provisioning_topic(topic)
