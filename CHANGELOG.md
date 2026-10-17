@@ -8,7 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
-- **S3 — SigV4 browser POST policies** — signed form uploads now verify their policy signature and registered credentials, expiration, exact and prefix conditions, field coverage and file-size bounds before writing. Under `AUTH=true` the form signer also needs the object write permissions. Registered IAM keys retain the bucket owner's account scope. Anonymous and legacy SigV2 form behavior is unchanged.
+- **S3 — signed browser POST policies** — SigV4 and legacy SigV2 form uploads now verify their policy signature and registered credentials, expiration, exact and prefix conditions, field coverage and file-size bounds before writing. Under `AUTH=true` the form signer also needs the object write permissions. Registered IAM keys retain the bucket owner's account scope. Anonymous form behavior is unchanged.
 
 ## [1.5.28] — 2026-10-16
 

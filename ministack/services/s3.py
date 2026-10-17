@@ -31,6 +31,7 @@ import contextvars
 import copy
 import datetime as _dt
 import hashlib
+import hmac
 import itertools
 import json
 import logging
@@ -4229,8 +4230,8 @@ def _enforce_post_policy_size(policy_b64: str, size: int):
     """Apply the `content-length-range` condition from a POST policy.
 
     Returns an error response when size is outside [min, max], else None.
-    Legacy forms use this size-only check; SigV4 forms validate all conditions
-    and credentials in _enforce_sigv4_post_policy.
+    Unsigned forms use this size-only check; signed forms validate all
+    conditions and credentials in _enforce_signed_post_policy.
     """
     if not policy_b64:
         return None
@@ -4265,11 +4266,12 @@ def _enforce_post_policy_size(policy_b64: str, size: int):
                 )
     return None
 
-def _enforce_sigv4_post_policy(fields: dict, bucket_name: str, region: str, size: int):
-    """Verify a SigV4 form and its expanded fields before any object mutation.
+def _enforce_signed_post_policy(fields: dict, bucket_name: str, region: str, size: int, sigv4: bool):
+    """Verify a signed form and its expanded fields before any object mutation.
 
-    POST signs the Base64 policy itself, rather than a canonical HTTP request.
-    Anonymous and legacy SigV2 forms retain their existing handling.
+    POST signs the Base64 policy itself, rather than a canonical HTTP request:
+    SigV4 with the scoped signing key, legacy SigV2 with HMAC-SHA1 of the secret.
+    Anonymous forms retain their existing handling.
     """
     def invalid():
         logger.debug("S3 POST rejected: invalid policy document")
@@ -4284,35 +4286,26 @@ def _enforce_sigv4_post_policy(fields: dict, bucket_name: str, region: str, size
         logger.debug("S3 POST rejected: %s", reason)
         return _error("InvalidArgument", "Invalid Argument", 400)
 
-    required = ("policy", "x-amz-algorithm", "x-amz-credential", "x-amz-date", "x-amz-signature")
+    if sigv4:
+        required = ("policy", "x-amz-algorithm", "x-amz-credential", "x-amz-date", "x-amz-signature")
+    else:
+        required = ("policy", "awsaccesskeyid", "signature")
     if not all(fields.get(name) for name in required):
         return invalid_argument("missing required signing field")
-    scope = fields["x-amz-credential"].split("/")
-    if (fields["x-amz-algorithm"] != "AWS4-HMAC-SHA256" or len(scope) != 5 or not all(scope)):
-        return invalid_argument("invalid signing fields")
-    access_key, date_stamp, signed_region, service, terminator = scope
-    try:
-        signed_at = _dt.datetime.strptime(fields["x-amz-date"], "%Y%m%dT%H%M%SZ")
-    except ValueError:
-        return invalid_argument("invalid signing date")
-    if (date_stamp != signed_at.strftime("%Y%m%d") or signed_region != region
-            or service != "s3" or terminator != "aws4_request"):
-        return invalid_argument("invalid credential scope")
-
-    encoded = fields["policy"]
-    try:
-        policy = json.loads(base64.b64decode(encoded, validate=True).decode("utf-8"))
-        if not isinstance(policy, dict):
-            return invalid()
-        expiration = policy.get("expiration")
-        conditions = policy.get("conditions")
-        if not isinstance(expiration, str) or not isinstance(conditions, list):
-            return invalid()
-        expires = _dt.datetime.fromisoformat(expiration.replace("Z", "+00:00"))
-        if expires.tzinfo is None:
-            return invalid()
-    except (ValueError, TypeError, RecursionError):
-        return invalid()
+    if sigv4:
+        scope = fields["x-amz-credential"].split("/")
+        if (fields["x-amz-algorithm"] != "AWS4-HMAC-SHA256" or len(scope) != 5 or not all(scope)):
+            return invalid_argument("invalid signing fields")
+        access_key, date_stamp, signed_region, service, terminator = scope
+        try:
+            signed_at = _dt.datetime.strptime(fields["x-amz-date"], "%Y%m%dT%H%M%SZ")
+        except ValueError:
+            return invalid_argument("invalid signing date")
+        if (date_stamp != signed_at.strftime("%Y%m%d") or signed_region != region
+                or service != "s3" or terminator != "aws4_request"):
+            return invalid_argument("invalid credential scope")
+    else:
+        access_key, signed_region = fields["awsaccesskeyid"], region
 
     # Use the signer's tenant only for credential and IAM resolution. The
     # bucket-owner scope chosen by _apply_bucket_scope must survive the upload.
@@ -4329,12 +4322,34 @@ def _enforce_sigv4_post_policy(fields: dict, bucket_name: str, region: str, size
         if credential.code == "InvalidToken":
             return _error("InvalidToken", credential.message, 400)
         return _error("InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records.", 403)
-    computed = calculate_signature(credential.secret_access_key, date_stamp, signed_region, "s3", encoded)
-    signature = fields["x-amz-signature"]
-    if not re.fullmatch(r"[0-9a-f]{64}", signature) or not signatures_match(computed, signature):
+    # The signature covers the Base64 policy as sent, so it is checked before decoding.
+    encoded = fields["policy"]
+    if sigv4:
+        computed = calculate_signature(credential.secret_access_key, date_stamp, signed_region, "s3", encoded)
+        signature = fields["x-amz-signature"]
+        signed = re.fullmatch(r"[0-9a-f]{64}", signature) and signatures_match(computed, signature)
+    else:
+        digest = hmac.new(credential.secret_access_key.encode(), encoded.encode(), hashlib.sha1).digest()
+        signature = fields["signature"]
+        signed = signature.isascii() and signatures_match(base64.b64encode(digest).decode(), signature)
+    if not signed:
         logger.debug("S3 POST rejected: signature mismatch")
         return _error("SignatureDoesNotMatch", "The request signature we calculated does not match the signature "
                       "you provided. Check your key and signing method.", 403)
+
+    try:
+        policy = json.loads(base64.b64decode(encoded, validate=True).decode("utf-8"))
+        if not isinstance(policy, dict):
+            return invalid()
+        expiration = policy.get("expiration")
+        conditions = policy.get("conditions")
+        if not isinstance(expiration, str) or not isinstance(conditions, list):
+            return invalid()
+        expires = _dt.datetime.fromisoformat(expiration.replace("Z", "+00:00"))
+        if expires.tzinfo is None:
+            return invalid()
+    except (ValueError, TypeError, RecursionError):
+        return invalid()
     if _dt.datetime.now(_dt.timezone.utc) >= expires:
         return denied("policy expired")
 
@@ -4348,7 +4363,12 @@ def _enforce_sigv4_post_policy(fields: dict, bucket_name: str, region: str, size
         elif isinstance(condition, list) and len(condition) == 3:
             operator, name, value = condition
             if operator == "content-length-range":
-                if type(name) is not int or type(value) is not int or name < 0 or value < name:
+                # AWS accepts numeric strings; other bounds fail the condition.
+                try:
+                    name, value = int(name), int(value)
+                except (TypeError, ValueError):
+                    return denied()
+                if name < 0 or value < name:
                     return invalid()
                 if size < name:
                     return _error("EntityTooSmall", "Your proposed upload is smaller than the minimum allowed object size.", 400)
@@ -4371,7 +4391,7 @@ def _enforce_sigv4_post_policy(fields: dict, bucket_name: str, region: str, size
             if not all(candidate == value if operator == "eq" else candidate.startswith(value) for candidate in candidates):
                 return denied()
             covered.add(name)
-    exempt = {"policy", "x-amz-signature", "file"}
+    exempt = {"policy", "x-amz-signature", "awsaccesskeyid", "signature", "file"}
     if any(name not in covered and name not in exempt and not name.startswith("x-ignore-") for name in values):
         return denied()
 
@@ -4419,8 +4439,8 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
     callers POST a multipart/form-data body to the bucket root. We honour
     `key` (with `${filename}` substitution), `Content-Type`, `x-amz-meta-*`,
     `x-amz-storage-class`, `x-amz-tagging`, `success_action_status`, and
-    `success_action_redirect`. SigV4 forms verify policy and signature before
-    writing the object, independently of AUTH.
+    `success_action_redirect`. Signed forms (SigV4 or SigV2) verify policy and
+    signature before writing the object, independently of AUTH.
     """
     parts = _parse_multipart_form(headers.get("content-type", ""), body)
 
@@ -4456,15 +4476,15 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
         return _error("InvalidArgument", "POST requires a file field.", 400)
 
     sigv4 = any(name in fields for name in ("x-amz-algorithm", "x-amz-credential", "x-amz-date", "x-amz-signature"))
-    if sigv4:
-        fields = {name: value.replace("${filename}", file_filename or "")
-                  if name not in {"policy", "x-amz-signature"} else value for name, value in fields.items()}
-    key_template = fields.get("key", "")
-    if not key_template:
+    signed = sigv4 or "awsaccesskeyid" in fields or "signature" in fields
+    # Form variables are expanded once, before the policy is checked.
+    fields = {name: value.replace("${filename}", file_filename or "")
+              if name not in {"policy", "x-amz-signature", "signature"} else value for name, value in fields.items()}
+    key = fields.get("key", "")
+    if not key:
         return _error("InvalidArgument", "Bucket POST must contain a field named 'key'.", 400)
-    key = key_template.replace("${filename}", file_filename or "")
-    if sigv4:
-        err = _enforce_sigv4_post_policy(fields, bucket_name, bucket["region"], len(file_value))
+    if signed:
+        err = _enforce_signed_post_policy(fields, bucket_name, bucket_region(bucket_name), len(file_value), sigv4)
     else:
         err = _enforce_post_policy_size(fields.get("policy", ""), len(file_value))
     if err:

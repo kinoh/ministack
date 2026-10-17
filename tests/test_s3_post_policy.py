@@ -31,11 +31,11 @@ def post_form(monkeypatch):
 
         class Form:
             def generate(self, *, fields=None, conditions=None, key_name="uploads/data.txt", expires=300,
-                         secret=None, token=None, access_key=None):
+                         secret=None, token=None, access_key=None, signature_version="s3v4"):
                 client = boto3.client(
                     "s3", endpoint_url="http://localhost", region_name="us-east-1",
                     aws_access_key_id=access_key or key[0], aws_secret_access_key=secret or key[1],
-                    aws_session_token=token, config=Config(signature_version="s3v4"),
+                    aws_session_token=token, config=Config(signature_version=signature_version),
                 )
                 return client.generate_presigned_post(
                     Bucket=bucket, Key=key_name, Fields=fields or {},
@@ -68,9 +68,11 @@ def post_form(monkeypatch):
         iam._user_inline_policies.pop(name, None)
 
 
-def test_signed_post_stores_bytes_and_metadata(post_form):
+@pytest.mark.parametrize("signature_version", ["s3v4", "s3"])
+def test_signed_post_stores_bytes_and_metadata(post_form, signature_version):
     fields = post_form.generate(fields={"x-amz-meta-author": "alice", "success_action_status": "201"},
-                                conditions=[{"x-amz-meta-author": "alice"}, {"success_action_status": "201"}])
+                                conditions=[{"x-amz-meta-author": "alice"}, {"success_action_status": "201"}],
+                                signature_version=signature_version)
     assert post_form.submit(fields)[0] == 201
     obj = s3._buckets[post_form.bucket]["objects"]["uploads/data.txt"]
     assert obj["body"] == b"contents"
@@ -86,12 +88,13 @@ def test_post_exact_conditions_reject_mismatched_fields(post_form, name, value):
     post_form.assert_rejected(form, "AccessDenied")
 
 
+@pytest.mark.parametrize("signature_version", ["s3v4", "s3"])
 @pytest.mark.parametrize("auth_enabled", [False, True])
-def test_post_signature_verified_in_both_auth_modes(post_form, monkeypatch, auth_enabled):
+def test_post_signature_verified_in_both_auth_modes(post_form, monkeypatch, auth_enabled, signature_version):
     import ministack.app as app_mod
 
     monkeypatch.setattr(app_mod, "AUTH", auth_enabled)
-    form = post_form.generate(secret=uuid.uuid4().hex)
+    form = post_form.generate(secret=uuid.uuid4().hex, signature_version=signature_version)
     post_form.assert_rejected(form, "SignatureDoesNotMatch", routed=True)
 
 
@@ -124,6 +127,12 @@ def test_post_variables_expanded_before_matching(post_form):
     assert obj["metadata"]["x-amz-meta-name"] == "data.txt"
 
 
+def test_post_variables_expanded_once(post_form):
+    form = post_form.generate(key_name="uploads/${filename}")
+    assert post_form.submit(form, filename="${filename}.txt")[0] == 204
+    assert list(s3._buckets[post_form.bucket]["objects"]) == ["uploads/${filename}.txt"]
+
+
 @pytest.mark.parametrize("extra", ["x-amz-meta-extra", "acl"])
 def test_post_uncovered_form_fields_rejected(post_form, extra):
     form = post_form.generate(fields={extra: "private"})
@@ -148,15 +157,23 @@ def test_post_size_range_inclusive(post_form, data, code):
         assert post_form.submit(form, data=data)[0] == 204
 
 
-def test_post_invalid_policy_rejected(post_form):
+@pytest.mark.parametrize("low,code", [("2", None), ("x", "AccessDenied")])
+def test_post_size_range_string_bounds(post_form, low, code):
+    form = post_form.generate(conditions=[["content-length-range", low, "3"]])
+    if code:
+        post_form.assert_rejected(form, code, data=b"12")
+    else:
+        assert post_form.submit(form, data=b"12")[0] == 204
+
+
+def test_post_modified_policy_fails_signature(post_form):
     form = post_form.generate()
-    form["policy"] = "invalid base64"
-    post_form.assert_rejected(form, "InvalidPolicyDocument")
+    form["policy"] = form["policy"][:-2]
+    post_form.assert_rejected(form, "SignatureDoesNotMatch")
 
 
-@pytest.mark.parametrize("condition", [["unknown", "$key", ""], ["content-length-range", "x", 10]])
-def test_post_invalid_condition_rejected(post_form, condition):
-    post_form.assert_rejected(post_form.generate(conditions=[condition]), "InvalidPolicyDocument")
+def test_post_invalid_condition_rejected(post_form):
+    post_form.assert_rejected(post_form.generate(conditions=[["unknown", "$key", ""]]), "InvalidPolicyDocument")
 
 
 def test_post_bucket_condition_uses_destination(post_form):
@@ -253,3 +270,12 @@ def test_rejected_post_preserves_existing_object_and_disk(post_form, monkeypatch
     s3._load_persisted_data()
     obj = s3._buckets[post_form.bucket]["objects"]["uploads/data.txt"]
     assert s3._read_body(post_form.bucket, "uploads/data.txt", obj) == b"original"
+
+
+def test_post_after_persisted_reload(post_form, monkeypatch, tmp_path):
+    monkeypatch.setattr(s3, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(s3, "S3_PERSIST", True)
+    assert post_form.submit(post_form.generate(), data=b"first")[0] == 204
+    s3._buckets.clear()
+    s3._load_persisted_data()
+    assert post_form.submit(post_form.generate(), data=b"second")[0] == 204
