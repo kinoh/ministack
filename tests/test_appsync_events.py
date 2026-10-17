@@ -788,9 +788,9 @@ def test_websocket_subscribe_receives_published_event(api):
         data = _drain_until(ws, lambda f: f.get("type") == "data")
         assert data is not None
         assert data["id"] == "sub-1"
-        # Per spec, the `event` field is an ARRAY of JSON-encoded strings.
-        assert isinstance(data["event"], list)
-        assert json.loads(data["event"][0]) == {"text": "hi"}
+        # AWS delivers one JSON-encoded string per data frame.
+        assert isinstance(data["event"], str)
+        assert json.loads(data["event"]) == {"text": "hi"}
     finally:
         ws.close()
 
@@ -805,7 +805,7 @@ def test_websocket_single_level_wildcard(api):
         first = _drain_until(ws, lambda f: f.get("type") == "data")
         assert first is not None
         assert first["id"] == "sub-1"
-        assert json.loads(first["event"][0]) == "a"
+        assert json.loads(first["event"]) == "a"
 
         # "/default/room1/child" is a two-segment suffix — should NOT match /default/*
         _publish_http(api, "/default/room1/child", [json.dumps("nope")])
@@ -824,7 +824,7 @@ def test_websocket_unsubscribe_stops_delivery(api):
         _publish_http(api, "/default/room1", [json.dumps("first")])
         first = _drain_until(ws, lambda f: f.get("type") == "data")
         assert first is not None
-        assert json.loads(first["event"][0]) == "first"
+        assert json.loads(first["event"]) == "first"
 
         ws.send_json({"type": "unsubscribe", "id": "sub-x"})
         unsub_ack = _drain_until(ws, lambda f: f.get("type") == "unsubscribe_success")
@@ -1006,7 +1006,7 @@ def test_websocket_discovers_resource_region_and_pins_frame_context(monkeypatch)
             assert data == {
                 "type": "data",
                 "id": "sub-regional",
-                "event": [event],
+                "event": event,
             }
 
             await incoming.put({"type": "websocket.disconnect"})
@@ -1210,7 +1210,7 @@ def test_fanout_publish_isolates_connections_by_api_id():
         assert await first_outbox.get() == {
             "type": "data",
             "id": "sub-first",
-            "event": [event],
+            "event": event,
         }
         assert second_outbox.empty()
 
@@ -1249,7 +1249,7 @@ def test_websocket_publish_frame_acks_and_fans_out(api):
         data = _drain_until(listener, lambda f: f.get("type") == "data")
         assert data is not None
         assert data["id"] == "sub-listener"
-        assert json.loads(data["event"][0]) == "over-ws"
+        assert json.loads(data["event"]) == "over-ws"
     finally:
         publisher.close()
         listener.close()
@@ -1547,3 +1547,39 @@ def test_appsync_events_service_hosts_are_not_s3_virtual_hosts():
             )
         )
         assert result is None
+
+
+@pytest.mark.parametrize("transport", ["http", "websocket"])
+def test_publish_batch_delivers_individual_event_strings(api, transport):
+    listener = _open_subscriber(api)
+    publisher = _open_subscriber(api) if transport == "websocket" else None
+    events = ['{ "message": "hello" }', '[1, 2]', '"text"']
+    try:
+        assert _subscribe(listener, "sub-batch", "/default/batch") == {
+            "type": "subscribe_success", "id": "sub-batch",
+        }
+        if publisher is None:
+            status, ack = _publish_http(api, "/default/batch", events)
+            assert status == 200
+        else:
+            publisher.send_json({
+                "type": "publish", "id": "pub-batch",
+                "channel": "/default/batch", "events": events,
+            })
+            ack = _drain_until(publisher, lambda f: f.get("type") == "publish_success")
+        assert ack is not None
+        assert len(ack["successful"]) == len(events)
+        assert ack["failed"] == []
+        received = []
+        for _ in events:
+            frame = _drain_until(listener, lambda f: f.get("type") == "data")
+            assert frame is not None
+            assert frame["id"] == "sub-batch"
+            assert isinstance(frame["event"], str)
+            received.append(frame["event"])
+        assert sorted(received) == sorted(events)
+        assert _drain_until(listener, lambda f: f.get("type") == "data", timeout=0.2) is None
+    finally:
+        listener.close()
+        if publisher is not None:
+            publisher.close()

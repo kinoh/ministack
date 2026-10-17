@@ -45,6 +45,7 @@ import ministack.services.glue as _glue
 import ministack.services.iam as _iam
 import ministack.services.iot as _iot
 import ministack.services.kinesis as _kinesis
+import ministack.services.kinesisanalyticsv2 as _kda
 import ministack.services.kms as _kms
 import ministack.services.lambda_svc as _lambda_svc
 import ministack.services.opensearch as _opensearch
@@ -710,6 +711,7 @@ _CUSTOM_NAME_REPLACEMENT = {
         ),
     },
     "AWS::IoT::DomainConfiguration": {"name": "DomainConfigurationName"},
+    "AWS::KinesisAnalyticsV2::Application": {"name": "ApplicationName"},
     # BackupVaultName is required, so every vault is custom-named. Measured on
     # an account: adding EncryptionKeyArn fails with the refusal sentence.
     "AWS::Backup::BackupVault": {
@@ -731,6 +733,11 @@ _CUSTOM_NAME_REPLACEMENT = {
     "AWS::AutoScaling::LaunchConfiguration": {
         "name": "LaunchConfigurationName",
         "requires_replacement": lambda old, new: old != new,
+    },
+    "AWS::S3::AccessPoint": {
+        "name": "Name",
+        "requires_replacement": lambda old, new: any(
+            old.get(p) != new.get(p) for p in ("Bucket", "BucketAccountId", "Name", "VpcConfiguration")),
     },
     "AWS::IAM::InstanceProfile": {
         "name": "InstanceProfileName",
@@ -1148,6 +1155,7 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::IoT::TopicRule": ("Tags", "list"),
     "AWS::KMS::Key": ("Tags", "list"),
     "AWS::Kinesis::Stream": ("Tags", "list"),
+    "AWS::KinesisAnalyticsV2::Application": ("Tags", "list"),
     "AWS::Lambda::Function": ("Tags", "list"),
     "AWS::Location::Tracker": ("Tags", "list"),
     "AWS::Logs::LogGroup": ("Tags", "list"),
@@ -1432,6 +1440,127 @@ def _s3_mrap_create(logical_id, props, stack_name):
 
 def _s3_mrap_delete(physical_id, props):
     _s3.delete_mrap(physical_id)
+
+
+def _s3_access_point_policy(props) -> str | None:
+    policy = props.get("Policy")
+    if policy is None:
+        return None
+    return policy if isinstance(policy, str) else json.dumps(policy)
+
+
+def _s3_access_point_attrs(record: dict) -> dict:
+    return {"Arn": _s3.access_point_arn(record["Name"]), "Alias": record["Alias"],
+            "Name": record["Name"], "NetworkOrigin": record["NetworkOrigin"]}
+
+
+def _s3_access_point_create(logical_id, props, stack_name):
+    """Provision an AWS::S3::AccessPoint through the same checks as the S3
+    Control API. The physical id (and Ref) is the name."""
+    name = props.get("Name") or _physical_name(stack_name, logical_id, lowercase=True, max_len=50)
+    try:
+        record = _s3.create_access_point(
+            name, props.get("Bucket", ""), props.get("VpcConfiguration"),
+            props.get("PublicAccessBlockConfiguration"), _s3_access_point_policy(props),
+            {t["Key"]: t["Value"] for t in props.get("Tags") or []},
+        )
+    except _s3.AccessPointError as exc:
+        raise ValueError(f"{exc.code}: {exc.message}") from exc
+    return name, _s3_access_point_attrs(record)
+
+
+def _s3_access_point_update(physical_id, old_props, new_props, stack_name):
+    """Policy, PublicAccessBlockConfiguration and Tags update in place."""
+    record = _s3._access_points.get(physical_id)
+    if record is None:
+        return _s3_access_point_create(physical_id, new_props, stack_name)
+    record["Policy"] = _s3_access_point_policy(new_props)
+    pab = {field: True for field in _s3._PAB_FIELDS}
+    pab.update({k: bool(v) for k, v in (new_props.get("PublicAccessBlockConfiguration") or {}).items()
+                if k in _s3._PAB_FIELDS})
+    record["PublicAccessBlockConfiguration"] = pab
+    record["Tags"] = {t["Key"]: t["Value"] for t in new_props.get("Tags") or []}
+    return physical_id, _s3_access_point_attrs(record)
+
+
+def _s3_access_point_delete(physical_id, props):
+    _s3._access_points.pop(physical_id, None)
+
+
+def _object_lambda_configuration(props) -> dict:
+    """``ObjectLambdaConfiguration`` in the S3 Control record's shape."""
+    config = props.get("ObjectLambdaConfiguration") or {}
+    transformations = []
+    for tc in config.get("TransformationConfigurations") or []:
+        aws_lambda = (tc.get("ContentTransformation") or {}).get("AwsLambda") or {}
+        transformation = {"Actions": list(tc.get("Actions") or []), "FunctionArn": aws_lambda.get("FunctionArn", "")}
+        if "FunctionPayload" in aws_lambda:
+            transformation["FunctionPayload"] = aws_lambda["FunctionPayload"]
+        transformations.append(transformation)
+    return {
+        "SupportingAccessPoint": config.get("SupportingAccessPoint", ""),
+        "CloudWatchMetricsEnabled": bool(config.get("CloudWatchMetricsEnabled", False)),
+        "AllowedFeatures": list(config.get("AllowedFeatures") or []),
+        "TransformationConfigurations": transformations,
+    }
+
+
+def _object_lambda_attrs(record: dict) -> dict:
+    return {"Arn": _s3.object_lambda_arn(record["Name"]), "Alias.Value": record["Alias"]["Value"],
+            "Alias.Status": record["Alias"]["Status"], "CreationDate": record["CreationDate"]}
+
+
+def _object_lambda_create(logical_id, props, stack_name):
+    """AWS::S3ObjectLambda::AccessPoint, through the S3 Control checks."""
+    name = props.get("Name") or _physical_name(stack_name, logical_id, lowercase=True, max_len=45)
+    try:
+        record = _s3.create_object_lambda_access_point(name, _object_lambda_configuration(props))
+    except _s3.AccessPointError as exc:
+        raise ValueError(f"{exc.code}: {exc.message}") from exc
+    return name, _object_lambda_attrs(record)
+
+
+def _object_lambda_update(physical_id, old_props, new_props, stack_name):
+    """Name replaces the access point; the configuration updates in place."""
+    record = _s3._object_lambda_access_points.get(physical_id)
+    if record is None:
+        return _object_lambda_create(physical_id, new_props, stack_name)
+    config = _object_lambda_configuration(new_props)
+    try:
+        _s3.validate_object_lambda_configuration(config)
+    except _s3.AccessPointError as exc:
+        raise ValueError(f"{exc.code}: {exc.message}") from exc
+    record["Configuration"] = config
+    return physical_id, _object_lambda_attrs(record)
+
+
+def _object_lambda_delete(physical_id, props):
+    _s3._object_lambda_access_points.pop(physical_id, None)
+
+
+def _object_lambda_policy_create(logical_id, props, stack_name):
+    """AWS::S3ObjectLambda::AccessPointPolicy; its physical id is the access point name."""
+    name = props.get("ObjectLambdaAccessPoint", "")
+    record = _s3._object_lambda_access_points.get(name)
+    if record is None:
+        raise ValueError(f"NoSuchAccessPoint: The specified accesspoint does not exist: {name}")
+    document = props.get("PolicyDocument")
+    record["Policy"] = document if isinstance(document, str) else json.dumps(document)
+    return name, {}
+
+
+def _object_lambda_policy_update(physical_id, old_props, new_props, stack_name):
+    if new_props.get("ObjectLambdaAccessPoint") != old_props.get("ObjectLambdaAccessPoint"):
+        result = _object_lambda_policy_create(physical_id, new_props, stack_name)
+        _delete_predecessor(_object_lambda_policy_delete, physical_id, old_props)
+        return result
+    return _object_lambda_policy_create(physical_id, new_props, stack_name)
+
+
+def _object_lambda_policy_delete(physical_id, props):
+    record = _s3._object_lambda_access_points.get(physical_id)
+    if record is not None:
+        record["Policy"] = None
 
 
 def _s3_attrs(name):
@@ -3439,6 +3568,99 @@ def _cwlogs_delete(physical_id, props):
     """Delete through DeleteLogGroup, which also drops the group's metric filters, policy and records."""
     _cw_logs._delete_log_group({"logGroupName": physical_id})
 
+
+# --- Managed Service for Apache Flink (kinesisanalyticsv2) ---
+
+def _kda_call(fn, data, resource_type):
+    """Run a kinesisanalyticsv2 operation and raise its error message."""
+    status, _, body = fn(data)
+    payload = json.loads(body) if body else {}
+    if status >= 400:
+        raise ValueError(f"{resource_type}: {payload.get('message') or payload.get('Message') or payload}")
+    return payload
+
+
+def _kda_application_create(logical_id, props, stack_name):
+    name = props.get("ApplicationName") or _physical_name(stack_name, logical_id)
+    data = {key: props[key] for key in (
+        "RuntimeEnvironment", "ServiceExecutionRole", "ApplicationConfiguration",
+        "ApplicationDescription", "ApplicationMode", "Tags") if props.get(key) is not None}
+    data["ApplicationName"] = name
+    _kda_call(_kda.create_application, data, "AWS::KinesisAnalyticsV2::Application")
+    if props.get("RunConfiguration"):
+        # Stored for the next StartApplication; CloudFormation does not start the application.
+        _kda._applications[name]["_RunConfiguration"] = copy.deepcopy(props["RunConfiguration"])
+    # Ref returns the application name (aws-resource-kinesisanalyticsv2-application).
+    return name, {}
+
+
+def _kda_application_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    _kda.replace_from_template(physical_id, new_props)
+    arn = _kda._applications[physical_id]["ApplicationARN"]
+    tags = _tag_map(new_props.get("Tags"))
+    if tags:
+        _kda._tags[arn] = tags
+    else:
+        _kda._tags.pop(arn, None)
+    return physical_id, {}
+
+
+def _kda_application_delete(physical_id, props):
+    if physical_id in _kda._applications:
+        _kda_call(lambda data: _kda.delete_application(data, check_timestamp=False),
+                  {"ApplicationName": physical_id}, "AWS::KinesisAnalyticsV2::Application")
+
+
+def _kda_logging_option_create(logical_id, props, stack_name):
+    option = props.get("CloudWatchLoggingOption") or {}
+    payload = _kda_call(_kda.add_logging_option, {
+        "ApplicationName": props.get("ApplicationName"), "CloudWatchLoggingOption": option,
+    }, "AWS::KinesisAnalyticsV2::ApplicationCloudWatchLoggingOption")
+    option_id = next(o["CloudWatchLoggingOptionId"] for o in payload["CloudWatchLoggingOptionDescriptions"]
+                     if o["LogStreamARN"] == option.get("LogStreamARN"))
+    # The physical id is the logging option id the service assigns.
+    return option_id, {}
+
+
+def _kda_logging_option_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    stream = (new_props.get("CloudWatchLoggingOption") or {}).get("LogStreamARN")
+    if stream != (old_props.get("CloudWatchLoggingOption") or {}).get("LogStreamARN"):
+        _kda_call(_kda.update_application, {
+            "ApplicationName": new_props.get("ApplicationName"),
+            "CloudWatchLoggingOptionUpdates": [
+                {"CloudWatchLoggingOptionId": physical_id, "LogStreamARNUpdate": stream}],
+        }, "AWS::KinesisAnalyticsV2::ApplicationCloudWatchLoggingOption")
+    return physical_id, {}
+
+
+def _kda_logging_option_delete(physical_id, props):
+    name = props.get("ApplicationName")
+    if name in _kda._applications:
+        _kda.delete_logging_option({"ApplicationName": name, "CloudWatchLoggingOptionId": physical_id})
+
+
+# --- CloudWatch Logs LogStream ---
+
+def _cwlogs_stream_create(logical_id, props, stack_name):
+    group = props.get("LogGroupName")
+    if not group:
+        raise ValueError("AWS::Logs::LogStream requires LogGroupName")
+    name = props.get("LogStreamName") or _physical_name(stack_name, logical_id, max_len=512)
+    status, _, body = _cw_logs._create_log_stream({"logGroupName": group, "logStreamName": name})
+    if status >= 400:
+        raise ValueError(f"AWS::Logs::LogStream: {json.loads(body).get('message')}")
+    # Ref returns the log stream name (aws-resource-logs-logstream).
+    return name, {}
+
+
+def _cwlogs_stream_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    return physical_id, {}
+
+
+def _cwlogs_stream_delete(physical_id, props):
+    group = _cw_logs._log_groups.get(props.get("LogGroupName"))
+    if group:
+        group["streams"].pop(physical_id, None)
 
 # --- CloudWatch Logs ResourcePolicy ---
 
@@ -14396,6 +14618,8 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::Backup::BackupVault": ("BackupVaultName", "EncryptionKeyArn"),
     "AWS::Location::Tracker": ("TrackerName", "KmsKeyId"),
     "AWS::S3::MultiRegionAccessPoint": ("Name", "PublicAccessBlockConfiguration", "Regions"),
+    "AWS::S3::AccessPoint": ("Bucket", "BucketAccountId", "Name", "VpcConfiguration"),
+    "AWS::S3ObjectLambda::AccessPoint": ("Name",),
     "AWS::AutoScaling::LaunchConfiguration": (
         "AssociatePublicIpAddress", "BlockDeviceMappings", "ClassicLinkVPCId",
         "ClassicLinkVPCSecurityGroups", "EbsOptimized", "IamInstanceProfile", "ImageId",
@@ -14472,6 +14696,9 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
         "FileSystemId", "IpAddress", "IpAddressType", "Ipv6Address", "SubnetId",
     ),
     "AWS::EFS::AccessPoint": ("ClientToken", "FileSystemId", "PosixUser", "RootDirectory"),
+    "AWS::KinesisAnalyticsV2::Application": ("ApplicationName", "ApplicationMode"),
+    "AWS::KinesisAnalyticsV2::ApplicationCloudWatchLoggingOption": ("ApplicationName",),
+    "AWS::Logs::LogStream": ("LogGroupName", "LogStreamName"),
 }
 
 
@@ -14517,6 +14744,21 @@ _RESOURCE_HANDLERS = {
     "AWS::S3::MultiRegionAccessPoint": {
         "create": _s3_mrap_create,
         "delete": _s3_mrap_delete,
+    },
+    "AWS::S3::AccessPoint": {
+        "create": _s3_access_point_create,
+        "update": _s3_access_point_update,
+        "delete": _s3_access_point_delete,
+    },
+    "AWS::S3ObjectLambda::AccessPoint": {
+        "create": _object_lambda_create,
+        "update": _object_lambda_update,
+        "delete": _object_lambda_delete,
+    },
+    "AWS::S3ObjectLambda::AccessPointPolicy": {
+        "create": _object_lambda_policy_create,
+        "update": _object_lambda_policy_update,
+        "delete": _object_lambda_policy_delete,
     },
     "AWS::S3::BucketPolicy": {
         "create": _s3_bucket_policy_create,
@@ -14726,6 +14968,24 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _cwlogs_delete,
         "import": _cwlogs_import,
+    },
+    "AWS::Logs::LogStream": {
+        "create": _cwlogs_stream_create,
+        "update": _cwlogs_stream_update,
+        "update_with_logical_id": True,
+        "delete": _cwlogs_stream_delete,
+    },
+    "AWS::KinesisAnalyticsV2::Application": {
+        "create": _kda_application_create,
+        "update": _kda_application_update,
+        "update_with_logical_id": True,
+        "delete": _kda_application_delete,
+    },
+    "AWS::KinesisAnalyticsV2::ApplicationCloudWatchLoggingOption": {
+        "create": _kda_logging_option_create,
+        "update": _kda_logging_option_update,
+        "update_with_logical_id": True,
+        "delete": _kda_logging_option_delete,
     },
     "AWS::Logs::ResourcePolicy": {
         "create": _cwlogs_resource_policy_create,
