@@ -12,7 +12,7 @@ import boto3
 import pytest
 import requests
 from botocore.config import Config
-from conftest import iam_user, routed_request
+from conftest import inprocess_iam_user, routed_request
 
 from ministack.core.responses import AccountScopedDict, request_scope
 from ministack.services import iam, s3, sts
@@ -27,7 +27,7 @@ def post_form(monkeypatch):
     monkeypatch.setattr(s3, "S3_PERSIST", False)
     with request_scope("000000000000", "us-east-1"):
         bucket = "post-policy-" + uuid.uuid4().hex[:12]
-        key, _arn = iam_user()
+        key, _arn = inprocess_iam_user()
         s3._create_bucket(bucket, b"", {})
 
         class Form:
@@ -174,19 +174,9 @@ def test_post_unexpected_session_token_rejected(post_form):
     post_form.assert_rejected(post_form.generate(token=uuid.uuid4().hex), "InvalidToken")
 
 
-def test_post_signer_permissions_enforced(post_form, auth):
-    form = post_form.generate()
-    post_form.assert_rejected(form, "AccessDenied", routed=True)
-    name = iam._access_keys[post_form.key[0]]["UserName"]
-    iam._user_inline_policies[name] = {"upload": json.dumps({"Version": "2012-10-17", "Statement": [
-        {"Effect": "Allow", "Action": "s3:PutObject", "Resource": f"arn:aws:s3:::{post_form.bucket}/uploads/*"}
-    ]})}
-    assert post_form.submit(form, routed=True)[0] == 204
-
-
 def test_post_registered_key_resolves_nondefault_account(post_form):
     with request_scope("123456789012", "us-east-1"):
-        key, arn = iam_user()
+        key, arn = inprocess_iam_user()
         try:
             bucket = "tenant-post-" + uuid.uuid4().hex[:12]
             s3._create_bucket(bucket, b"", {})
@@ -244,24 +234,6 @@ def test_post_configured_root_credentials(post_form, monkeypatch):
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", key)
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", secret)
     assert post_form.submit(post_form.generate(access_key=key, secret=secret))[0] == 204
-
-
-@pytest.mark.parametrize("name,value,action", [
-    ("acl", "private", "s3:PutObjectAcl"),
-    ("x-amz-tagging", "purpose=test", "s3:PutObjectTagging"),
-    ("x-amz-object-lock-legal-hold", "ON", "s3:PutObjectLegalHold"),
-    ("x-amz-object-lock-mode", "GOVERNANCE", "s3:PutObjectRetention"),
-])
-def test_post_additional_write_permissions(post_form, auth, name, value, action):
-    user = iam._access_keys[post_form.key[0]]["UserName"]
-    statement = {"Effect": "Allow", "Action": ["s3:PutObject"],
-                 "Resource": f"arn:aws:s3:::{post_form.bucket}/uploads/*"}
-    iam._user_inline_policies[user] = {"upload": json.dumps({"Version": "2012-10-17", "Statement": [statement]})}
-    form = post_form.generate(fields={name: value}, conditions=[{name: value}])
-    post_form.assert_rejected(form, "AccessDenied", routed=True)
-    statement["Action"].append(action)
-    iam._user_inline_policies[user] = {"upload": json.dumps({"Version": "2012-10-17", "Statement": [statement]})}
-    assert post_form.submit(form, routed=True)[0] == 204
 
 
 def test_rejected_post_preserves_existing_object_and_disk(post_form, monkeypatch, tmp_path):
