@@ -329,6 +329,21 @@ def test_backward_token_survives_late_arrivals(log_group):
     assert messages == ["e10", "e15"]
 
 
+def test_backward_token_from_tail_excludes_later_events(log_group):
+    now = int(time.time() * 1000)
+    put_messages(log_group, "s", [(now + 10, "e10"), (now + 20, "e20")])
+    _, body = get_page(log_group, "s", startFromHead=True)
+    messages, body = get_page(log_group, "s", nextToken=body["nextForwardToken"])
+    assert messages == []
+    # e30 arrives after the reader reached the tail.
+    assert logs._put_log_events({
+        "logGroupName": log_group, "logStreamName": "s",
+        "logEvents": [{"timestamp": now + 30, "message": "e30"}],
+    })[0] == 200
+    messages, _ = get_page(log_group, "s", nextToken=body["nextBackwardToken"])
+    assert messages == ["e10", "e20"]
+
+
 def test_forward_token_splits_equal_timestamps_exactly_once(log_group):
     now = int(time.time() * 1000)
     put_messages(log_group, "s", [(now, "a"), (now, "b"), (now, "c")])
