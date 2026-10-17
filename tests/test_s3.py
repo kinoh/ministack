@@ -9113,6 +9113,23 @@ def test_s3_copy_permission_contract(
                 assert body.read() == b"auth-contract"
 
 
+@pytest.fixture
+def auth_s3_post_bucket(s3):
+    """A versioned bucket supporting lock fields, with complete version cleanup."""
+    bucket = f"auth-post-{uuid.uuid4().hex}"
+    s3.create_bucket(Bucket=bucket, ObjectLockEnabledForBucket=True)
+    try:
+        yield bucket
+    finally:
+        versions = s3.list_object_versions(Bucket=bucket)
+        for version in versions.get("Versions", []):
+            s3.put_object_legal_hold(Bucket=bucket, Key=version["Key"], LegalHold={"Status": "OFF"})
+            s3.delete_object(Bucket=bucket, Key=version["Key"], VersionId=version["VersionId"])
+        for marker in versions.get("DeleteMarkers", []):
+            s3.delete_object(Bucket=bucket, Key=marker["Key"], VersionId=marker["VersionId"])
+        s3.delete_bucket(Bucket=bucket)
+
+
 @pytest.mark.auth_contract
 @pytest.mark.parametrize("permission,field,value,extra_action", [
     ("none", None, None, None),
@@ -9130,14 +9147,14 @@ def test_s3_copy_permission_contract(
     )
 ])
 def test_s3_post_permission_contract(
-    auth_enabled, iam_user, s3, auth_s3_objects, permission, field, value, extra_action,
+    auth_enabled, iam_user, s3, auth_s3_post_bucket, permission, field, value, extra_action,
 ):
     """Multipart credentials identify the signer, including optional write actions."""
     from xml.etree import ElementTree
 
     import requests
 
-    _, destination = auth_s3_objects
+    destination = auth_s3_post_bucket
     resource = f"arn:aws:s3:::{destination}/copied"
     statements = []
     if permission != "none":
@@ -9159,15 +9176,11 @@ def test_s3_post_permission_contract(
     )
     response = requests.post(form["url"], data=form["fields"],
                              files={"file": ("contract.txt", b"post-auth-contract")}, timeout=10)
-    try:
-        if auth_enabled and permission != "allow":
-            assert response.status_code == 403, response.text
-            assert ElementTree.fromstring(response.content).findtext("Code") == "AccessDenied"
-            assert s3.list_objects_v2(Bucket=destination).get("Contents", []) == []
-        else:
-            assert response.status_code == 204, response.text
-            with s3.get_object(Bucket=destination, Key="copied")["Body"] as body:
-                assert body.read() == b"post-auth-contract"
-    finally:
-        if response.status_code == 204 and field == "x-amz-object-lock-legal-hold":
-            s3.put_object_legal_hold(Bucket=destination, Key="copied", LegalHold={"Status": "OFF"})
+    if auth_enabled and permission != "allow":
+        assert response.status_code == 403, response.text
+        assert ElementTree.fromstring(response.content).findtext("Code") == "AccessDenied"
+        assert s3.list_objects_v2(Bucket=destination).get("Contents", []) == []
+    else:
+        assert response.status_code == 204, response.text
+        with s3.get_object(Bucket=destination, Key="copied")["Body"] as body:
+            assert body.read() == b"post-auth-contract"
