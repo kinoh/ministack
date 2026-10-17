@@ -970,7 +970,7 @@ async def _fanout_publish(api_id: str, channel: str, events: list) -> tuple[list
 
     Shared between the HTTP ``POST /event`` handler and the WebSocket ``publish``
     frame handler so both paths return the same ``(successful, failed)`` shape.
-    Each outbound frame uses ``"event": [<json-string>]`` per the spec.
+    Each outbound frame carries one JSON-encoded string, as observed on AWS.
     """
     successful: list = []
     failed: list = []
@@ -991,7 +991,7 @@ async def _fanout_publish(api_id: str, channel: str, events: list) -> tuple[list
                         await conn["outbox"].put({
                             "type": "data",
                             "id": sub_id,
-                            "event": [ev],
+                            "event": ev,
                         })
             successful.append({"identifier": identifier, "index": idx})
         except Exception as e:
