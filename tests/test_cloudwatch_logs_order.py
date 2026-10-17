@@ -290,3 +290,59 @@ def test_concurrent_late_batches_preserve_every_event(log_group):
     stream = logs._log_groups[log_group]["streams"]["shared"]
     assert stream["firstEventTimestamp"] == now
     assert stream["lastEventTimestamp"] == now + 31
+
+
+def get_page(group, stream, **parameters):
+    response = logs._get_log_events({"logGroupName": group, "logStreamName": stream, **parameters})
+    assert response[0] == 200
+    body = json.loads(response[2])
+    return [event["message"] for event in body["events"]], body
+
+
+def test_forward_token_survives_late_arrivals(log_group):
+    now = int(time.time() * 1000)
+    put_messages(log_group, "s", [(now + 10, "e10"), (now + 20, "e20"), (now + 30, "e30")])
+    messages, body = get_page(log_group, "s", startFromHead=True, limit=2)
+    assert messages == ["e10", "e20"]
+    # One event lands behind the cursor, one between the cursor and stored history.
+    assert logs._put_log_events({
+        "logGroupName": log_group, "logStreamName": "s",
+        "logEvents": [{"timestamp": now + 15, "message": "e15"},
+                      {"timestamp": now + 25, "message": "e25"}],
+    })[0] == 200
+    messages, _ = get_page(log_group, "s", nextToken=body["nextForwardToken"], limit=2)
+    assert messages == ["e25", "e30"]
+
+
+def test_backward_token_survives_late_arrivals(log_group):
+    now = int(time.time() * 1000)
+    put_messages(log_group, "s", [(now + 10, "e10"), (now + 20, "e20"), (now + 30, "e30")])
+    messages, body = get_page(log_group, "s", limit=2)
+    assert messages == ["e20", "e30"]
+    # e15 is older than everything read so far; e25 is behind the backward cursor.
+    assert logs._put_log_events({
+        "logGroupName": log_group, "logStreamName": "s",
+        "logEvents": [{"timestamp": now + 15, "message": "e15"},
+                      {"timestamp": now + 25, "message": "e25"}],
+    })[0] == 200
+    messages, _ = get_page(log_group, "s", nextToken=body["nextBackwardToken"], limit=2)
+    assert messages == ["e10", "e15"]
+
+
+def test_forward_token_splits_equal_timestamps_exactly_once(log_group):
+    now = int(time.time() * 1000)
+    put_messages(log_group, "s", [(now, "a"), (now, "b"), (now, "c")])
+    seen = []
+    messages, body = get_page(log_group, "s", startFromHead=True, limit=1)
+    seen += messages
+    # An equal-time arrival sorts after existing ties, so it is still ahead of the cursor.
+    assert logs._put_log_events({
+        "logGroupName": log_group, "logStreamName": "s",
+        "logEvents": [{"timestamp": now, "message": "d"}],
+    })[0] == 200
+    for _ in range(5):
+        messages, body = get_page(log_group, "s", nextToken=body["nextForwardToken"], limit=1)
+        if not messages:
+            break
+        seen += messages
+    assert seen == ["a", "b", "c", "d"]
