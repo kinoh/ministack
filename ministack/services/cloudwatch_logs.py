@@ -1226,10 +1226,11 @@ def _event_cursor(history, size, position, forward):
 
     The cursor is "<timestamp>:<k>", the k-th position within that timestamp's
     run. Late events stay on their own side of the anchor, and equal-time
-    arrivals sort after their ties, so the boundary never shifts. "-" marks
-    the head (forward) or tail (backward) of the stream.
+    arrivals sort after their ties, so the boundary never shifts. A backward
+    boundary at the tail anchors on the last event, so later events stay
+    after it. "-" marks the head of the stream, or a boundary in an empty one.
     """
-    anchor = position - 1 if forward else position
+    anchor = position - 1 if forward or position == size else position
     if not 0 <= anchor < size:
         return "-"
     timestamp = history[anchor]["timestamp"]
