@@ -3,7 +3,6 @@
 Expected conditions come from the S3 POST policy documentation, not a live AWS run.
 """
 import asyncio
-import json
 import time
 import uuid
 from xml.etree import ElementTree
