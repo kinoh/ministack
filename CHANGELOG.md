@@ -8,7 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
-- **CloudWatch Logs — ordered, bounded event reads** — keep stream histories chronological for API, Lambda, CodeBuild and DynamoDB import logs, including late batches and restored snapshots. `FilterLogEvents` seeks to time bounds and merges stream cursors until its limit is reached instead of collecting, filtering and sorting every event; newer events in an earlier-scanned stream cannot displace older matches. Equal timestamps retain stream-selection and arrival order, `GetLogEvents` reads late arrivals chronologically, and Live Tail still receives the exact newly ingested batch.
+- **CloudWatch Logs — ordered, bounded event reads** — keep stream histories chronological for API, Lambda, CodeBuild and DynamoDB import logs, including late batches and restored snapshots. `FilterLogEvents` seeks to time bounds and merges stream cursors until its limit is reached instead of collecting, filtering and sorting every event; newer events in an earlier-scanned stream cannot displace older matches. Equal timestamps retain stream-selection and arrival order, `GetLogEvents` reads late arrivals chronologically with tokens anchored to returned events, so pages neither repeat nor skip events on the unread side, and Live Tail still receives the exact newly ingested batch.
 
 ## [1.5.28] — 2026-10-16
 

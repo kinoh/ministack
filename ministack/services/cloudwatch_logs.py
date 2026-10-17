@@ -1221,6 +1221,32 @@ def _resolve_log_group_name(data):
     return ident
 
 
+def _event_cursor(history, size, position, forward):
+    """Name a GetLogEvents boundary by the returned event beside it.
+
+    The cursor is "<timestamp>:<k>", the k-th position within that timestamp's
+    run. Late events stay on their own side of the anchor, and equal-time
+    arrivals sort after their ties, so the boundary never shifts. "-" marks
+    the head (forward) or tail (backward) of the stream.
+    """
+    anchor = position - 1 if forward else position
+    if not 0 <= anchor < size:
+        return "-"
+    timestamp = history[anchor]["timestamp"]
+    return f"{timestamp}:{position - bisect_left(history, timestamp, hi=size, key=_event_timestamp)}"
+
+
+def _event_token_position(history, size, token):
+    direction, _, cursor = token.partition("/")
+    if direction not in ("f", "b"):
+        raise ValueError(token)
+    forward = direction == "f"
+    if cursor == "-":
+        return forward, 0 if forward else size
+    timestamp, offset = cursor.split(":")
+    return forward, bisect_left(history, int(timestamp), hi=size, key=_event_timestamp) + int(offset)
+
+
 def _get_log_events(data):
     group = _resolve_log_group_name(data)
     stream = data.get("logStreamName")
@@ -1241,37 +1267,35 @@ def _get_log_events(data):
             f"The specified log stream does not exist: {stream}", 400,
         )
 
-    all_events = _log_groups[group]["streams"][stream]["events"]
+    with _log_events_lock:
+        history = _log_groups[group]["streams"][stream]["events"]
+        size = len(history)
+    lower = bisect_left(history, start_time, hi=size, key=_event_timestamp) if start_time is not None else 0
+    upper = bisect_right(history, end_time, lo=lower, hi=size, key=_event_timestamp) if end_time is not None else size
 
-    filtered = all_events
-    if start_time is not None:
-        filtered = [e for e in filtered if e["timestamp"] >= start_time]
-    if end_time is not None:
-        filtered = [e for e in filtered if e["timestamp"] <= end_time]
-
-    # Parse offset from token: f/<offset> for forward, b/<offset> for backward
-    offset = 0
+    forward = start_from_head
+    position = lower if forward else upper
     if next_token:
         try:
-            offset = int(next_token.split("/", 1)[1])
-        except (IndexError, ValueError):
-            offset = 0
-
-    if start_from_head or (next_token and next_token.startswith("f/")):
-        page = filtered[offset:offset + limit]
-        new_forward = f"f/{offset + len(page)}"
-        new_backward = f"b/{offset}"
+            forward, position = _event_token_position(history, size, next_token)
+        except ValueError:
+            return error_response_json("InvalidParameterException", "The specified nextToken is invalid.", 400)
+        position = min(max(position, lower), upper)
+    if forward:
+        start, end = position, min(position + limit, upper)
     else:
-        end = len(filtered) - offset if next_token and next_token.startswith("b/") else len(filtered)
-        start = max(0, end - limit)
-        page = filtered[start:end]
-        new_forward = f"f/{end}"
-        new_backward = f"b/{len(filtered) - start}"
+        start, end = max(lower, position - limit), position
+    page = history[start:end]
 
+    forward_token = f"f/{_event_cursor(history, size, end, True)}"
+    backward_token = f"b/{_event_cursor(history, size, start, False)}"
     # AWS behaviour: when at end of stream, return the caller's token
     # so SDK clients stop paginating
-    forward_token = next_token if (next_token and len(page) < limit) else new_forward
-    backward_token = next_token if (next_token and offset == 0 and next_token.startswith("b/")) else new_backward
+    if next_token and not page:
+        if forward:
+            forward_token = next_token
+        else:
+            backward_token = next_token
 
     # OutputLogEvent is only {timestamp, message, ingestionTime}; strip internal
     # fields (e.g. the eventId used by FilterLogEvents / GetLogRecord).
