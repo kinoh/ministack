@@ -1239,7 +1239,7 @@ def resolve_principal(access_key_id: str,
 
 @dataclass(frozen=True)
 class SignedRequest:
-    """A header-signed request as it arrived."""
+    """A header- or query-signed request as it arrived."""
 
     access_key_id: str
     method: str
@@ -1247,6 +1247,7 @@ class SignedRequest:
     query_params: dict
     headers: dict
     body: bytes = b""
+    presigned: bool = False
 
 
 _signed_request: contextvars.ContextVar[SignedRequest | None] = contextvars.ContextVar(
@@ -1254,13 +1255,14 @@ _signed_request: contextvars.ContextVar[SignedRequest | None] = contextvars.Cont
 
 
 def pin_signed_request(method: str, raw_path: str, query_params: dict, raw_headers: list) -> None:
-    """Keep a request header-signed with an IAM user or STS session key as sent, for its signature check."""
+    """Keep a request signed with an IAM user or STS session key as sent, for its signature check."""
     from ministack.core.router import extract_access_key_id
     from ministack.core.sigv4 import decode_header_value
 
     authorization = decode_header_value(next((v for n, v in raw_headers if n.lower() == b"authorization"), b""))
-    access_key_id = extract_access_key_id({"authorization": authorization})
-    if not authorization.startswith("AWS4-HMAC-SHA256") or _is_root_key(access_key_id):
+    presigned = not authorization.startswith("AWS4-HMAC-SHA256") and _query_signed(query_params)
+    access_key_id = extract_access_key_id({"authorization": authorization}, query_params if presigned else None)
+    if not (authorization.startswith("AWS4-HMAC-SHA256") or presigned) or _is_root_key(access_key_id):
         _signed_request.set(None)
         return
     headers: dict[str, str] = {}
@@ -1268,7 +1270,18 @@ def pin_signed_request(method: str, raw_path: str, query_params: dict, raw_heade
         key, text = name.decode("latin-1").lower(), decode_header_value(value)
         # SigV4 signs a header sent on several lines as its values joined by a bare comma.
         headers[key] = f"{headers[key]},{text}" if key in headers else text
-    _signed_request.set(SignedRequest(access_key_id, method, raw_path, query_params, headers))
+    _signed_request.set(SignedRequest(access_key_id, method, raw_path, query_params, headers, presigned=presigned))
+
+
+def _query_signed(query_params: dict) -> bool:
+    """A SigV4 query-string signature; S3 checks its own presigned URLs."""
+    def value(name):
+        found = query_params.get(name) or query_params.get(name.lower()) or [""]
+        return found[0] if isinstance(found, list) else found
+
+    scope = value("X-Amz-Credential").split("/")
+    return value("X-Amz-Algorithm") == "AWS4-HMAC-SHA256" and bool(scope[0]) and (
+        len(scope) < 4 or scope[3] != "s3")
 
 
 def pin_signed_body(body: bytes) -> None:
@@ -1281,19 +1294,30 @@ def pin_signed_body(body: bytes) -> None:
 def authenticate(access_key_id: str, account_id: str) -> AuthError | ResolvedCredential | None:
     """Check the pinned request's time, session token and signature: its credential, a failure, or None."""
     from ministack.core.responses import _account_from_sts_session
-    from ministack.core.sigv4 import header_signature_failure, parse_header_signature, request_time_failure
+    from ministack.core.sigv4 import (
+        header_signature_failure,
+        parse_header_signature,
+        parse_query_signature,
+        request_time_failure,
+    )
 
     request = _signed_request.get()
     if request is None or request.access_key_id != access_key_id:
         return None
     _signed_request.set(None)  # checked once; the request's later checks skip it
-    signature = parse_header_signature(request.headers)
+    if request.presigned:
+        signature = parse_query_signature(request.query_params)
+    else:
+        signature = parse_header_signature(request.headers)
     if isinstance(signature, tuple):
         return AuthError(*signature)
     skewed = request_time_failure(signature)
     if skewed:
         return AuthError(*skewed)
-    token = request.headers.get("x-amz-security-token", "")
+    if request.presigned:
+        token = (request.query_params.get("X-Amz-Security-Token") or [""])[0]
+    else:
+        token = request.headers.get("x-amz-security-token", "")
     credential = resolve_credential(access_key_id, _account_from_sts_session(access_key_id) or account_id, token)
     if isinstance(credential, CredentialResolutionError):
         if credential.code == "InvalidToken":
@@ -1304,7 +1328,7 @@ def authenticate(access_key_id: str, account_id: str) -> AuthError | ResolvedCre
         return AuthError(credential.code, credential.message)
     failure = header_signature_failure(
         signature, credential.secret_access_key, request.method, request.raw_path,
-        request.query_params, request.headers, request.body,
+        request.query_params, request.headers, request.body, presigned=request.presigned,
     )
     return AuthError(*failure) if failure else credential
 
