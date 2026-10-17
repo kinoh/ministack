@@ -9159,11 +9159,15 @@ def test_s3_post_permission_contract(
     )
     response = requests.post(form["url"], data=form["fields"],
                              files={"file": ("contract.txt", b"post-auth-contract")}, timeout=10)
-    if auth_enabled and permission != "allow":
-        assert response.status_code == 403, response.text
-        assert ElementTree.fromstring(response.content).findtext("Code") == "AccessDenied"
-        assert s3.list_objects_v2(Bucket=destination).get("Contents", []) == []
-    else:
-        assert response.status_code == 204, response.text
-        with s3.get_object(Bucket=destination, Key="copied")["Body"] as body:
-            assert body.read() == b"post-auth-contract"
+    try:
+        if auth_enabled and permission != "allow":
+            assert response.status_code == 403, response.text
+            assert ElementTree.fromstring(response.content).findtext("Code") == "AccessDenied"
+            assert s3.list_objects_v2(Bucket=destination).get("Contents", []) == []
+        else:
+            assert response.status_code == 204, response.text
+            with s3.get_object(Bucket=destination, Key="copied")["Body"] as body:
+                assert body.read() == b"post-auth-contract"
+    finally:
+        if response.status_code == 204 and field == "x-amz-object-lock-legal-hold":
+            s3.put_object_legal_hold(Bucket=destination, Key="copied", LegalHold={"Status": "OFF"})
