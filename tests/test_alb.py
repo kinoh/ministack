@@ -1060,6 +1060,102 @@ def test_elbv2_dataplane_preserves_repeated_target_headers(elbv2, chunked, cooki
         thread.join(timeout=5)
 
 
+def _start_request_capture_server():
+    """Serve one connection: keep its raw request-header lines, answer 200 "ok"."""
+    import socket as _socket
+    import threading
+
+    sock = _socket.socket()
+    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    header_lines = []
+
+    def _serve():
+        try:
+            conn, _ = sock.accept()
+            with conn:
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                header_lines.extend(data.partition(b"\r\n\r\n")[0].decode("latin-1").split("\r\n")[1:])
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+        except OSError:
+            pass
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+    return sock, thread, header_lines
+
+
+def test_elbv2_dataplane_sends_forwarded_headers_once(elbv2):
+    """A request that already carries X-Forwarded-* reaches the target with one field per name."""
+    sock, thread, header_lines = _start_request_capture_server()
+    lb_name = f"dp-alb-xff-{_uuid_mod.uuid4().hex[:8]}"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(
+        elbv2, lb_name, "127.0.0.1", sock.getsockname()[1]
+    )
+    try:
+        request = _req.Request(f"{_endpoint}/_alb/{lb_name}/", headers={
+            "X-Forwarded-For": "203.0.113.5", "X-Forwarded-Proto": "https", "X-Forwarded-Port": "443",
+        })
+        with _req.urlopen(request, timeout=10) as resp:
+            assert resp.read() == b"ok"
+        thread.join(timeout=5)
+        names = [line.split(":", 1)[0].lower() for line in header_lines]
+        for name in ("x-forwarded-for", "x-forwarded-proto", "x-forwarded-port"):
+            assert names.count(name) == 1, header_lines
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        sock.close()
+        thread.join(timeout=5)
+
+
+def test_elbv2_target_connection_closed_when_the_caller_stops_waiting():
+    """A caller that gives up before the target answers closes the target connection
+    instead of leaving it open for the idle timeout."""
+    import asyncio
+    import socket as _socket
+    import threading
+
+    from ministack.services import alb
+
+    sock = _socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    port = sock.getsockname()[1]
+    closed = threading.Event()
+
+    def _serve():
+        conn, _ = sock.accept()
+        with conn:
+            conn.settimeout(30)
+            data = b""
+            while b"\r\n\r\n" not in data:
+                data += conn.recv(4096)
+            if conn.recv(4096) == b"":
+                closed.set()
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+
+    async def _give_up():
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(alb._proxy_http_target(
+                {"Id": "127.0.0.1", "Port": port}, {"Port": port}, "GET", "/", {}, b"", {},
+            ), 0.5)
+        return await asyncio.to_thread(closed.wait, 5)
+
+    try:
+        assert asyncio.run(_give_up())
+    finally:
+        sock.close()
+        thread.join(timeout=35)
+
+
 @pytest.mark.serial
 def test_elbv2_dataplane_connection_close_target_gets_the_idle_timeout(elbv2):
     """A `Connection: close` target must be bounded by the idle timeout too.
