@@ -1466,7 +1466,7 @@ def test_untrusted_origin_certificate_answers_502(cloudfront, untrusted_https_or
 # ---------------------------------------------------------------------------
 
 
-def _alb_origin_dist(cloudfront, lb_dns: str, port: int, custom_headers: list) -> str:
+def _alb_origin_dist(cloudfront, lb_dns: str, port: int, custom_headers: list, read_timeout: int = 30) -> str:
     suffix = _uuid_mod.uuid4().hex[:10]
     origin = {
         "Id": "alb-origin",
@@ -1474,7 +1474,7 @@ def _alb_origin_dist(cloudfront, lb_dns: str, port: int, custom_headers: list) -
         "CustomOriginConfig": {
             "HTTPPort": port, "HTTPSPort": 443, "OriginProtocolPolicy": "http-only",
             "OriginSslProtocols": {"Quantity": 1, "Items": ["TLSv1.2"]},
-            "OriginReadTimeout": 30, "OriginKeepaliveTimeout": 5,
+            "OriginReadTimeout": read_timeout, "OriginKeepaliveTimeout": 5,
         },
     }
     if custom_headers:
@@ -1570,6 +1570,46 @@ def test_registered_alb_origin_relays_an_ip_target_response(cloudfront, elbv2, a
         assert xff_lines[0].split(":", 1)[1].strip() == "203.0.113.5, 127.0.0.1"
     finally:
         elbv2.delete_target_group(TargetGroupArn=tg_arn)
+
+
+def test_registered_alb_origin_timeout_answers_504_and_closes_the_target_connection(cloudfront, elbv2, alb_origin):
+    # A target that reads the request and never answers.
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    target_port = listener.getsockname()[1]
+    closed = threading.Event()
+
+    def serve():
+        conn, _ = listener.accept()
+        with conn:
+            conn.settimeout(10)
+            data = b""
+            while b"\r\n\r\n" not in data:
+                data += conn.recv(4096)
+            if conn.recv(4096) == b"":
+                closed.set()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    tg_arn = elbv2.create_target_group(
+        Name=f"cf-alb-{_uuid_mod.uuid4().hex[:8]}", Protocol="HTTP", Port=target_port,
+        VpcId="vpc-00000001", TargetType="ip",
+    )["TargetGroups"][0]["TargetGroupArn"]
+    try:
+        elbv2.register_targets(TargetGroupArn=tg_arn, Targets=[{"Id": "127.0.0.1", "Port": target_port}])
+        elbv2.modify_listener(ListenerArn=alb_origin["listener_arn"],
+                              DefaultActions=[{"Type": "forward", "TargetGroupArn": tg_arn}])
+        dist_host = _alb_origin_dist(cloudfront, alb_origin["dns"], 80, [], read_timeout=1)
+
+        status, headers, _body = _get(dist_host, "/anything")
+        assert status == 504
+        assert headers.get("X-Cache") == "Error from cloudfront"
+        assert closed.wait(5)
+    finally:
+        elbv2.delete_target_group(TargetGroupArn=tg_arn)
+        listener.close()
+        thread.join(timeout=10)
 
 
 def test_streamed_alb_body_without_its_final_frame_is_an_origin_failure():

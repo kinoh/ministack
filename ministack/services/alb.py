@@ -2200,11 +2200,13 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
 
     hop_by_hop = {"host", "content-length", "connection", "transfer-encoding",
                   "accept-encoding"}
-    fwd = {k: v for k, v in (headers or {}).items() if k.lower() not in hop_by_hop}
-    fwd["X-Forwarded-For"] = (headers or {}).get("x-forwarded-for") or "127.0.0.1"
-    fwd.setdefault("X-Forwarded-Proto", "http")
-    fwd.setdefault("X-Forwarded-Port", "80")
-    fwd["X-Amzn-Trace-Id"] = "Root=1-%08x-%s" % (
+    # One spelling per name, so the fields set below replace a forwarded one
+    # instead of going out as a second line.
+    fwd = {k.lower(): v for k, v in (headers or {}).items() if k.lower() not in hop_by_hop}
+    fwd["x-forwarded-for"] = fwd.get("x-forwarded-for") or "127.0.0.1"
+    fwd.setdefault("x-forwarded-proto", "http")
+    fwd.setdefault("x-forwarded-port", "80")
+    fwd["x-amzn-trace-id"] = "Root=1-%08x-%s" % (
         int(time.time()),
         "".join(random.choices("0123456789abcdef", k=24)),
     )
@@ -2215,8 +2217,9 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
     # https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-troubleshooting.html#http-504-issues
     from ministack.core.responses import StreamingResponse
 
+    conn = http.client.HTTPConnection(host, port, timeout=TARGET_CONNECT_TIMEOUT)
+
     def _open():
-        conn = http.client.HTTPConnection(host, port, timeout=TARGET_CONNECT_TIMEOUT)
         try:
             conn.connect()
             sock = conn.sock
@@ -2226,10 +2229,19 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
         except Exception as e:
             with contextlib.suppress(Exception):
                 conn.close()
-            return None, None, None, e
-        return conn, resp, sock, None
+            return None, None, e
+        return resp, sock, None
 
-    conn, resp, sock, err = await asyncio.to_thread(_open)
+    opening = asyncio.ensure_future(asyncio.to_thread(_open))
+    try:
+        resp, sock, err = await asyncio.shield(opening)
+    except asyncio.CancelledError:
+        # The caller stopped waiting (a CloudFront origin timeout, say): wake a
+        # blocked read and close the connection once the opening thread returns.
+        with contextlib.suppress(Exception):
+            conn.sock.shutdown(socket.SHUT_RDWR)
+        opening.add_done_callback(lambda _: conn.close())
+        raise
     if resp is None:
         return (502, {"Content-Type": "application/json"},
                 json.dumps({"message": f"Target {host}:{port} connect error: {err}"}).encode())
